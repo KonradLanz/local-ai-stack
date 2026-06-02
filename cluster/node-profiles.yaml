@@ -1,0 +1,107 @@
+# =============================================================================
+# cluster/node-profiles.yaml
+# Node capability profiles for local-ai-stack cluster.
+# Each node self-selects its profile on first run based on detected hardware.
+# License: AGPL-3.0-or-later OR MIT — Copyright 2026 GrEEV.com KG
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Profile: PRIMARY
+# MacBook Pro M2 Max 96GB, Apple Mac Studio/Pro, high-RAM Apple Silicon
+# Role: Full-capability node. Runs large models. Acts as cluster coordinator.
+# ---------------------------------------------------------------------------
+primary:
+  description: "Beefy Apple Silicon node (64GB+ unified RAM)"
+  role: coordinator          # also handles inference for all thin clients
+  model_tier: large
+  ollama_port: 11434
+  openwebui_port: 3000
+  # Models suitable for this node (pick one as default)
+  recommended_models:
+    - llama3.3:70b            # best general-purpose at 96GB
+    - llama3.1:70b
+    - qwen2.5:32b             # strong at coding + multilingual (AT/DE)
+    - mistral-large:latest
+    - nomic-embed-text        # for RAG embeddings
+  # Cluster: accept incoming inference requests from all thin nodes
+  accept_remote_inference: true
+  bind_address: "0.0.0.0"    # listen on LAN, not just localhost
+  # pfsense DHCP reservation recommended: set static IP in pfsense
+  # and record it in cluster/network-map.yaml
+
+# ---------------------------------------------------------------------------
+# Profile: SECONDARY
+# Apple Mac Mini M2/M4 16-32GB, MacBook Pro 16-32GB
+# Role: Mid-tier inference. Runs medium models. Falls back to PRIMARY.
+# ---------------------------------------------------------------------------
+secondary:
+  description: "Mid-tier Apple Silicon node (16-32GB unified RAM)"
+  role: worker
+  model_tier: medium
+  ollama_port: 11434
+  openwebui_port: 3001        # avoid port clash if co-located
+  recommended_models:
+    - llama3.1:8b
+    - qwen2.5:7b
+    - phi4:latest
+    - nomic-embed-text
+  accept_remote_inference: true
+  bind_address: "0.0.0.0"
+  # Routing: for large-model requests, forward to PRIMARY if available
+  fallback_to: primary
+
+# ---------------------------------------------------------------------------
+# Profile: QNAP
+# QNAP NAS, 24GB RAM, minimal/no GPU
+# Role: Tiny local model for NAS-aware tasks (file ops, indexing queries).
+#       ALL other inference routed to PRIMARY/SECONDARY over LAN.
+# ---------------------------------------------------------------------------
+qnap:
+  description: "QNAP NAS node (up to 24GB RAM, no discrete GPU)"
+  role: thin-worker
+  model_tier: tiny
+  ollama_port: 11434
+  openwebui_port: 3002
+  recommended_models:
+    - qwen2.5:1.5b            # fits in 2GB, good instruction following
+    - phi3.5-mini:latest      # 2.2GB, strong reasoning for size
+    - llama3.2:1b             # 1.3GB fallback
+  # This node ONLY runs its tiny model for local tasks.
+  # All other queries are proxied to PRIMARY via ollama-proxy.
+  local_only_tasks:
+    - "file listing"
+    - "NAS status"
+    - "local search index"
+    - "IPR filter classification"  # tiny model does local privacy screening
+  accept_remote_inference: false
+  proxy_to: primary           # forward heavy requests here
+  bind_address: "127.0.0.1"  # do NOT expose Ollama externally on NAS
+  # Container Station (Docker) required on QNAP
+
+# ---------------------------------------------------------------------------
+# Profile: WINDOWS-THIN
+# Windows PC, 8-16GB RAM, 2GB+ VRAM (GTX/RTX class)
+# Role: GPU-accelerated tiny/small model for specialized local tasks.
+#       Routing to PRIMARY for anything beyond its model tier.
+# ---------------------------------------------------------------------------
+windows-thin:
+  description: "Windows thin node (8-16GB RAM, 2GB+ VRAM)"
+  role: thin-worker
+  model_tier: tiny-gpu
+  ollama_port: 11434
+  openwebui_port: 3003
+  recommended_models:
+    # GPU-friendly GGUF quants that fit in 2-4GB VRAM
+    - qwen2.5:1.5b-instruct-q4_K_M   # 1.1GB VRAM
+    - phi3.5-mini:q4_K_M              # 1.8GB VRAM
+    - deepseek-coder:1.3b             # 1GB VRAM — good for code assist
+    - nomic-embed-text                # 0.3GB VRAM — for local RAG only
+  local_only_tasks:
+    - "code completion"
+    - "local file Q&A"
+    - "offline draft editing"
+  accept_remote_inference: false
+  proxy_to: primary
+  # Windows: Ollama uses CUDA/ROCm automatically if GPU drivers present.
+  # Install Ollama from https://ollama.com/download/windows
+  # No Docker required — Ollama runs natively on Windows
