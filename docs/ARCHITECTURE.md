@@ -1,54 +1,101 @@
 # Architecture
 
-## Repo Lineage
+## Repository Dependency Chain
 
 ```
 KonradLanz/ExecutionPolicy-Foundation   ← PowerShell policy bootstrap (Windows)
         │
-KonradLanz/bootstrap-foundation         ← OS-aware shell/pkg bootstrap
-        │                                  macOS, Ubuntu, Alpine, QNAP
+KonradLanz/bootstrap-foundation         ← OS + HARDWARE detection (upstream)
+        │   lib/detect-os.sh            ← $OS, $PKG_MGR
+        │   lib/detect-hardware.sh      ← $HW_*, $HW_NODE_PROFILE
+        │   lib/detect-hardware.ps1     ← $HW hashtable (Windows)
         │
 KonradLanz/local-ai-stack               ← THIS REPO
+        │   consumes detection — never duplicates it
         │
         ├── KonradLanz/structured-pdf-pipeline  ← PDF extraction feeds RAG
         └── KonradLanz/dotfiles-macos            ← shell aliases for ollama/webui
 ```
+
+**Design rule:** OS and hardware detection live in bootstrap-foundation.
+local-ai-stack sources those files, reads the exported variables,
+and branches on them. No OS sniffing in local-ai-stack scripts.
+
+---
+
+## What bootstrap-foundation/lib/detect-hardware.sh provides
+
+| Variable | Example value | Used for |
+|---|---|---|
+| `HW_RAM_MB` | 98304 | Node sizing decisions |
+| `HW_UNIFIED_MB` | 98304 | Apple Silicon — same pool as RAM |
+| `HW_VRAM_MB` | 2048 | Windows/Linux discrete GPU |
+| `HW_INFERENCE_MB` | 78643 | Model size ceiling (80% of unified) |
+| `HW_CPU_ARCH` | arm64 | Binary selection (Ollama ARM vs x86) |
+| `HW_CHIPSET` | apple-silicon | Routing + install path |
+| `HW_APPLE_CHIP` | m2 | Log output, model tuning |
+| `HW_GPU_VENDOR` | apple | GPU backend selection |
+| `HW_NODE_PROFILE` | primary | **Key: drives everything downstream** |
 
 ---
 
 ## Cluster Network Topology
 
 ```
- pfsense router (192.168.1.1)
-   │  DHCP reservations for all nodes
-   │  (MAC → fixed IP, set in Services > DHCP > Static Mappings)
+ pfsense router
+   │  DHCP static mappings (MAC → fixed IP)
    │
    ├─── MacBook Pro M2 Max 96GB [PRIMARY]  192.168.1.10
-   │       Ollama :11434  (LAN-visible, 0.0.0.0)
-   │       Open WebUI :3000
-   │       Cluster proxy :11430  ← all thin nodes point here
-   │       Discovery daemon  (probes LAN every 30s)
-   │       Models: llama3.3:70b, qwen2.5:32b, nomic-embed-text
+   │       HW_NODE_PROFILE=primary
+   │       HW_INFERENCE_MB ≈ 78643MB
+   │       Ollama :11434 (0.0.0.0 — LAN visible)
+   │       Cluster proxy :11430
+   │       Models: llama3.3:70b, qwen2.5:32b
    │
    ├─── Mac Mini M2/M4 [SECONDARY]          192.168.1.11
-   │       Ollama :11434  (LAN-visible)
-   │       Models: llama3.1:8b, qwen2.5:7b
-   │       Fallback if PRIMARY offline
+   │       HW_NODE_PROFILE=secondary
+   │       Ollama :11434 (LAN visible)
+   │       Models: llama3.1:8b
    │
    ├─── QNAP NAS 24GB [THIN: qnap]          192.168.1.20
-   │       Ollama :11434  (localhost only, security)
-   │       Open WebUI :3002  (NAS-local access)
-   │       Tiny model: qwen2.5:1.5b (NAS tasks, IPR screening)
-   │       ALL other inference → proxied to PRIMARY
+   │       HW_NODE_PROFILE=qnap
+   │       HW_INFERENCE_MB ≈ 8192MB
+   │       Ollama :11434 (127.0.0.1 only)
+   │       Model: qwen2.5:1.5b or 3b
    │
-   ├─── Windows PC 1 [THIN: windows-thin]   192.168.1.30
-   │       Ollama :11434  (localhost, GPU-accelerated)
-   │       GPU model: phi3.5-mini or qwen2.5:1.5b-q4_K_M
-   │       Specialty: code completion, offline editing
-   │       ALL other inference → to PRIMARY via proxy
+   ├─── Windows PC 1 [THIN]                 192.168.1.30
+   │       HW_NODE_PROFILE=windows-thin
+   │       HW_VRAM_MB=2048, HW_INFERENCE_MB=2048
+   │       Ollama :11434 (127.0.0.1 only)
+   │       Model: phi3.5-mini or qwen2.5:1.5b-q4
    │
-   └─── Windows PC 2 [THIN: windows-thin]   192.168.1.31
-           Same as PC 1
+   └─── Windows PC 2 [THIN]                 192.168.1.31
+           same as PC 1
+```
+
+---
+
+## hw-profile.json — the handshake artifact
+
+Every install script writes `cluster/hw-profile.json` via `hw_json()` or
+`HW-ToJson`. The discovery daemon (`cluster/discover.py`) reads this on
+startup to know the local node's own capabilities without re-probing hardware.
+The JSON is gitignored (generated, machine-specific).
+
+Example for MacBook M2 Max 96GB:
+```json
+{
+  "cpu_arch": "arm64",
+  "chipset": "apple-silicon",
+  "apple_chip": "m2",
+  "ram_mb": 98304,
+  "unified_mb": 98304,
+  "vram_mb": 0,
+  "inference_mb": 78643,
+  "gpu_vendor": "apple",
+  "node_profile": "primary",
+  "profile_reason": "Apple Silicon m2, 98304MB unified — primary coordinator"
+}
 ```
 
 ---
@@ -56,88 +103,20 @@ KonradLanz/local-ai-stack               ← THIS REPO
 ## Inference Routing Logic
 
 ```
-Query arrives at cluster proxy (:11430)
+Query → cluster proxy (:11430)
   ↓
- parse model hint from request body
+  parse model hint
   ↓
-  ├── tiny model request (1b, 1.5b, phi3.5-mini)
-  │       → check thin nodes first (qnap, windows-thin)
-  │       → if offline → fall back to PRIMARY
+  ├── tiny model (1b, 1.5b, phi3.5-mini keywords)
+  │     → thin node (qnap/windows-thin) if online
+  │     → fallback to PRIMARY
   │
-  └── any other request
-          → PRIMARY (highest-tier online node)
-          → if PRIMARY offline → SECONDARY
-          → if both offline → 503 error
+  └── any other model
+        → PRIMARY (highest HW_INFERENCE_MB online)
+        → fallback: SECONDARY
+        → 503 if all offline
 ```
 
-Node availability is refreshed every 30 seconds by `cluster/discover.py`.
-The proxy reads `cluster/live-nodes.json` (written by discover) and
-serves the best node with sub-millisecond overhead.
-
----
-
-## pfsense DHCP Reservation Setup
-
-1. Log into pfsense: `http://192.168.1.1` (or your gateway IP)
-2. **Services → DHCP Server → LAN**
-3. Scroll to **DHCP Static Mappings** → **Add**
-4. Enter: MAC address, IP address, hostname
-5. Repeat for each node
-6. **Diagnostics → Edit File**: optionally add DNS overrides so nodes
-   resolve by hostname (`macbook-primary.local`, `qnap-nas.local`, etc.)
-7. Update `cluster/network-map.yaml` with the reserved IPs
-
----
-
-## Node Self-Selection
-
-Each node runs its own installer from `cluster/`:
-
-| Node type | Script | Profile auto-applied |
-|---|---|---|
-| MacBook Pro / Apple Silicon 64GB+ | `cluster/install-primary.sh` | `primary` |
-| Mac Mini / Apple Silicon 16-32GB | `cluster/install-primary.sh` (sets `OLLAMA_MODEL=llama3.1:8b`) | `secondary` |
-| QNAP NAS | `cluster/install-qnap.sh` | `qnap` |
-| Windows 8-16GB + GPU | `cluster/install-windows-thin.ps1` | `windows-thin` |
-
-Profiles and model recommendations are in `cluster/node-profiles.yaml`.
-
----
-
-## IPR Filter in Cluster Context
-
-```
-Thin node (QNAP / Windows)
-  │  user query → tiny local model for NAS/local tasks
-  │
-  └── if needs web search → perplexity_search()
-          │  ipr_filter.screen_query()   ← runs on local node
-          │  (tiny model can do local LLM classification)
-          │
-          ├── BLOCKED → log, return block message
-          ├── REDACTED → sanitized query → Perplexity API
-          └── CLEAN → original query → Perplexity API
-```
-
-The IPR filter runs **on the originating node** before anything leaves
-the LAN. This means even thin nodes with tiny models perform privacy
-screening locally before any outbound API call.
-
----
-
-## Data Flow for PDFs
-
-```
-structured-pdf-pipeline output
-  ↓
-Open WebUI Knowledge Base (upload via UI or API)
-  ↓
-Vector + BM25 index (local, in Docker volume on PRIMARY)
-  ↓
-Model retrieves relevant chunks per query (RAG)
-  ↓
-Model answers — no external call needed for indexed PDFs
-```
-
-Thin nodes can access the PRIMARY's Open WebUI instance at
-`http://192.168.1.10:3000` from any device on the LAN.
+Node capability is read from `cluster/live-nodes.json`,
+which includes each node's `inference_mb` from their `hw-profile.json`.
+This means routing decisions are hardware-aware, not just profile-name-aware.
