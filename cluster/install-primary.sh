@@ -1,171 +1,128 @@
 #!/usr/bin/env bash
-# =============================================================================
-# cluster/install-primary.sh
-# PRIMARY coordinator setup (MacBook Pro / Apple Silicon 32GB+)
-# License: AGPL-3.0-or-later OR MIT — Copyright 2026 GrEEV.com KG
-# =============================================================================
+# cluster/install-primary.sh — MacBook PRIMARY node setup
+# Copyright 2026 GrEEV.com KG
+# AGPL-3.0-or-later
 set -euo pipefail
-GREEN="\033[0;32m"; YELLOW="\033[1;33m"; RED="\033[0;31m"; CYAN="\033[0;36m"; RESET="\033[0m"
-info()  { echo -e "${GREEN}[PRIMARY]${RESET} $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
-error() { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
-step()  { echo -e "${CYAN}[STEP]${RESET}  $*"; }
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+echo ''
+echo '================================================'
+echo '  local-ai-stack: PRIMARY node setup'
+echo '================================================'
+echo ''
 
-# ---------------------------------------------------------------------------
-# 1. Load shared detection from bootstrap-foundation
-# ---------------------------------------------------------------------------
-step "Loading OS + hardware detection from bootstrap-foundation..."
-
-# Locate bootstrap-foundation: sibling directory or $BOOTSTRAP_FOUNDATION env
-BF_LIB="${BOOTSTRAP_FOUNDATION:-$(cd "$REPO_ROOT/../bootstrap-foundation" 2>/dev/null && pwd)}/lib"
-
-if [ ! -d "$BF_LIB" ]; then
-  warn "bootstrap-foundation/lib not found at $BF_LIB"
-  warn "Cloning bootstrap-foundation next to this repo..."
-  git clone https://github.com/KonradLanz/bootstrap-foundation.git \
-    "$(dirname "$REPO_ROOT")/bootstrap-foundation"
-  BF_LIB="$(dirname "$REPO_ROOT")/bootstrap-foundation/lib"
+# --------------------------------------------------------------------------
+# 1. Hardware detection (from bootstrap-foundation)
+# --------------------------------------------------------------------------
+echo '[1/7] Hardware detection...'
+BF_LIB="$HOME/git/bootstrap-foundation/lib"
+if [ ! -f "$BF_LIB/detect-hardware.sh" ]; then
+  echo '  bootstrap-foundation not found — cloning...'
+  mkdir -p "$HOME/git"
+  git clone --depth=1 https://github.com/KonradLanz/bootstrap-foundation.git \
+    "$HOME/git/bootstrap-foundation"
 fi
-
-# shellcheck source=../../bootstrap-foundation/lib/detect-os.sh
-. "$BF_LIB/detect-os.sh"
-detect_os
-
-# shellcheck source=../../bootstrap-foundation/lib/detect-hardware.sh
 . "$BF_LIB/detect-hardware.sh"
-detect_hardware
-print_hw_summary
+export_hw_profile  # writes cluster/hw-profile.json
+echo '  OK'
 
-# ---------------------------------------------------------------------------
-# 2. Verify this node qualifies as PRIMARY
-# ---------------------------------------------------------------------------
-if [ "$HW_NODE_PROFILE" != primary ]; then
-  warn "Node profile is '$HW_NODE_PROFILE', not 'primary'."
-  warn "This script is designed for Apple Silicon 32GB+ coordinators."
-  warn "Continuing, but consider running install-qnap.sh or install-windows-thin.ps1 instead."
-fi
-
-info "Node: $HW_APPLE_CHIP, ${HW_UNIFIED_MB}MB unified, profile=$HW_NODE_PROFILE"
-
-# ---------------------------------------------------------------------------
-# 3. Model selection based on HW_INFERENCE_MB
-# ---------------------------------------------------------------------------
-if   [ "$HW_INFERENCE_MB" -ge 65536 ] 2>/dev/null; then
-  PRIMARY_MODELS="llama3.3:70b qwen2.5:32b nomic-embed-text"
-elif [ "$HW_INFERENCE_MB" -ge 32768 ] 2>/dev/null; then
-  PRIMARY_MODELS="llama3.1:8b qwen2.5:14b nomic-embed-text"
-else
-  PRIMARY_MODELS="llama3.1:8b qwen2.5:7b nomic-embed-text"
-fi
-info "Models for this node: $PRIMARY_MODELS"
-
-# ---------------------------------------------------------------------------
-# 4. Install Ollama (macOS)
-# ---------------------------------------------------------------------------
-step "Installing Ollama..."
+# --------------------------------------------------------------------------
+# 2. Ollama
+# --------------------------------------------------------------------------
+echo '[2/7] Ollama...'
 if ! command -v ollama &>/dev/null; then
-  curl -fsSL https://ollama.com/install.sh | sh
+  curl -fsSL https://ollama.ai/install.sh | sh
+fi
+ollama serve &>/dev/null & disown 2>/dev/null || true
+sleep 2
+echo '  OK'
+
+# --------------------------------------------------------------------------
+# 3. Python venv (mesh daemon deps — isolated, never touches system Python)
+# --------------------------------------------------------------------------
+echo '[3/7] Python venv...'
+VENV="$REPO_ROOT/.venv"
+if [ ! -d "$VENV" ]; then
+  python3 -m venv "$VENV"
+fi
+# Only install pyyaml — everything else is stdlib
+"$VENV/bin/pip" install --quiet --upgrade pip
+"$VENV/bin/pip" install --quiet pyyaml
+echo '  venv: .venv (pyyaml only)'
+echo '  OK'
+
+# --------------------------------------------------------------------------
+# 4. network-map.json — copy example if no config exists yet
+# --------------------------------------------------------------------------
+echo '[4/7] Network map...'
+MAP_JSON="$REPO_ROOT/cluster/network-map.json"
+MAP_YAML="$REPO_ROOT/cluster/network-map.yaml"
+if [ ! -f "$MAP_JSON" ] && [ ! -f "$MAP_YAML" ]; then
+  cp "$REPO_ROOT/cluster/network-map.json.example" "$MAP_JSON"
+  echo '  ⚠  Copied network-map.json.example → network-map.json'
+  echo '  ⚠  Edit cluster/network-map.json with your real IPs before continuing'
+  echo ''
+elif [ -f "$MAP_JSON" ]; then
+  echo '  network-map.json ✓'
 else
-  info "Ollama already installed: $(ollama --version 2>/dev/null)"
+  echo '  network-map.yaml ✓ (pyyaml required — available in .venv)'
 fi
 
-# Configure Ollama to bind LAN-visible (so thin nodes can reach it)
-# macOS: launchd plist
-PLIST="$HOME/Library/LaunchAgents/com.local-ai-stack.ollama.plist"
-if [ ! -f "$PLIST" ]; then
-  step "Writing launchd plist (Ollama on 0.0.0.0:11434)..."
-  cat > "$PLIST" << 'PLIST_EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.local-ai-stack.ollama</string>
-  <key>ProgramArguments</key><array>
-    <string>/usr/local/bin/ollama</string><string>serve</string>
-  </array>
-  <key>EnvironmentVariables</key><dict>
-    <key>OLLAMA_HOST</key><string>0.0.0.0:11434</string>
-    <key>OLLAMA_ORIGINS</key><string>*</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/ollama-primary.log</string>
-  <key>StandardErrorPath</key><string>/tmp/ollama-primary.log</string>
-</dict></plist>
-PLIST_EOF
-  launchctl load "$PLIST" 2>/dev/null || true
-  info "Ollama launchd plist loaded (LAN-visible on 0.0.0.0:11434)"
-fi
-
-# ---------------------------------------------------------------------------
-# 5. Pull models
-# ---------------------------------------------------------------------------
-step "Pulling models: $PRIMARY_MODELS"
-for MODEL in $PRIMARY_MODELS; do
-  info "Pulling $MODEL..."
-  ollama pull "$MODEL" || warn "Failed to pull $MODEL — skip and continue"
-done
-
-# ---------------------------------------------------------------------------
-# 6. Write hw-profile.json (consumed by cluster/discover.py on startup)
-# ---------------------------------------------------------------------------
-step "Writing hardware profile to cluster/hw-profile.json..."
-mkdir -p "$REPO_ROOT/cluster"
-hw_json > "$REPO_ROOT/cluster/hw-profile.json"
-info "Hardware profile: $(cat "$REPO_ROOT/cluster/hw-profile.json")"
-
-# ---------------------------------------------------------------------------
-# 7. Start Open WebUI + cluster proxy via Docker Compose
-# ---------------------------------------------------------------------------
-step "Starting Open WebUI + cluster proxy..."
+# --------------------------------------------------------------------------
+# 5. Open WebUI (Docker)
+# --------------------------------------------------------------------------
+echo '[5/7] Open WebUI...'
 if command -v docker &>/dev/null; then
-  cd "$REPO_ROOT"
-  docker compose up -d openwebui
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'open-webui'; then
+    docker compose up -d open-webui 2>/dev/null || \
+      docker run -d --name open-webui \
+        -p 3000:8080 \
+        -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
+        --restart always \
+        ghcr.io/open-webui/open-webui:main
+  fi
+  echo '  Open WebUI: http://localhost:3000'
 else
-  warn "Docker not found. Install Docker Desktop for Mac, then run:"
-  warn "  cd $REPO_ROOT && docker compose up -d"
+  echo '  ⚠  Docker not found — skipping Open WebUI (install Docker Desktop)'
 fi
+echo '  OK'
 
-# ---------------------------------------------------------------------------
-# 8. Start cluster daemon scripts
-# ---------------------------------------------------------------------------
-step "Starting cluster discover + proxy daemons..."
-PID_DIR="$REPO_ROOT/.pids"
-mkdir -p "$PID_DIR"
-
-# discover.py
-if [ -f "$REPO_ROOT/cluster/discover.py" ]; then
-  nohup python3 "$REPO_ROOT/cluster/discover.py" \
-    > /tmp/local-ai-discover.log 2>&1 &
-  echo $! > "$PID_DIR/discover.pid"
-  info "Discovery daemon started (PID $(cat "$PID_DIR/discover.pid"))"
+# --------------------------------------------------------------------------
+# 6. Mesh daemon (background)
+# --------------------------------------------------------------------------
+echo '[6/7] Mesh daemon...'
+PID_FILE="$REPO_ROOT/.mesh-node.pid"
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+  echo '  already running (pid '"$(cat "$PID_FILE")"')'
+else
+  "$VENV/bin/python" -m mesh.node &
+  echo $! > "$PID_FILE"
+  echo '  started (pid '"$(cat "$PID_FILE")"')'
 fi
+echo '  OK'
 
-# proxy.py
-if [ -f "$REPO_ROOT/cluster/proxy.py" ]; then
-  nohup python3 "$REPO_ROOT/cluster/proxy.py" \
-    > /tmp/local-ai-proxy.log 2>&1 &
-  echo $! > "$PID_DIR/proxy.pid"
-  info "Cluster proxy started on :11430 (PID $(cat "$PID_DIR/proxy.pid"))"
+# --------------------------------------------------------------------------
+# 7. Discovery daemon (background)
+# --------------------------------------------------------------------------
+echo '[7/7] Discovery daemon...'
+PID_FILE2="$REPO_ROOT/.discover.pid"
+if [ -f "$PID_FILE2" ] && kill -0 "$(cat "$PID_FILE2")" 2>/dev/null; then
+  echo '  already running'
+else
+  "$VENV/bin/python" cluster/discover.py &
+  echo $! > "$PID_FILE2"
+  echo '  started'
 fi
+echo '  OK'
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-NODE_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 'YOUR-IP')
-echo ""
-info "============================================================"
-info "  PRIMARY coordinator ready!"
-info ""
-info "  Ollama (LAN)   : http://$NODE_IP:11434"
-info "  Cluster proxy  : http://localhost:11430"
-info "  Open WebUI     : http://localhost:3000"
-info ""
-info "  Point thin nodes to:  http://$NODE_IP:11430"
-info ""
-info "  NEXT: Note MAC for pfsense DHCP reservation:"
-info "        $(ifconfig en0 2>/dev/null | awk '/ether/{print $2}' || echo 'see System Settings')"
-info "  NEXT: Update cluster/network-map.yaml with reserved IP $NODE_IP"
-info "============================================================"
+echo ''
+echo '================================================'
+echo '  PRIMARY setup complete'
+echo '================================================'
+echo ''
+echo '  Mesh node:   http://localhost:11430/mesh/status'
+echo '  Open WebUI:  http://localhost:3000'
+echo '  Discover:    python3 cluster/discover.py --once'
+echo '  (use .venv/bin/python3 if pyyaml needed)'
+echo ''
