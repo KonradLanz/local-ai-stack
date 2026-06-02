@@ -1,0 +1,58 @@
+{
+  "_comment": "JSON fallback for network-map.yaml when pyyaml is unavailable. Copy to network-map.json and fill in your IPs.",
+  "cluster_name": "greev-home-lab",
+  "subnet": "192.168.1.0/24",
+  "gateway": "192.168.1.1",
+  "nodes": [
+    {
+      "name": "macbook-primary",
+      "profile": "primary",
+      "hostname": "macbook-primary",
+      "ip": "192.168.1.10",
+      "mac": "",
+      "ollama_port": 11434,
+      "openwebui_port": 3000,
+      "enabled": true
+    },
+    {
+      "name": "mac-mini-secondary",
+      "profile": "secondary",
+      "hostname": "mac-mini-secondary",
+      "ip": "192.168.1.11",
+      "mac": "",
+      "ollama_port": 11434,
+      "openwebui_port": 3001,
+      "enabled": false
+    },
+    {
+      "name": "qnap-nas",
+      "profile": "qnap",
+      "hostname": "qnap-nas",
+      "ip": "192.168.1.20",
+      "mac": "",
+      "ollama_port": 11434,
+      "openwebui_port": 3002,
+      "enabled": true
+    },
+    {
+      "name": "windows-pc-1",
+      "profile": "windows-thin",
+      "hostname": "windows-pc-1",
+      "ip": "192.168.1.30",
+      "mac": "",
+      "ollama_port": 11434,
+      "openwebui_port": 3003,
+      "enabled": false
+    },
+    {
+      "name": "windows-pc-2",
+      "profile": "windows-thin",
+      "hostname": "windows-pc-2",
+      "ip": "192.168.1.31",
+      "mac": "",
+      "ollama_port": 11434,
+      "openwebui_port": 3003,
+      "enabled": false
+    }
+  ]
+}

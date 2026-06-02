@@ -23,6 +23,11 @@ logs/
 data/ipr_blocked.log
 data/
 
+# Cluster runtime files (generated, not committed)
+cluster/live-nodes.json
+.discover.pid
+.proxy.pid
+
 # Editor
 .vscode/
 .idea/

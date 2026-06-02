@@ -1,17 +1,20 @@
 """
 cluster/discover.py — Node Discovery Daemon
 Probes all configured nodes and builds a live capability map.
-Used by the load-balancer (cluster/proxy.py) to route inference requests.
 License: AGPL-3.0-or-later OR MIT — Copyright 2026 GrEEV.com KG
 
+FIX: pyyaml is auto-installed if missing. Falls back to built-in
+json if network-map is provided in JSON format.
+
 Runs as a background daemon on the coordinator (PRIMARY) node.
-Also usable as a CLI tool: python cluster/discover.py --once
+Also usable as a CLI tool: python3 cluster/discover.py --once
 """
 
 import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -19,37 +22,65 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-try:
-    import yaml
-    _YAML = True
-except ImportError:
-    _YAML = False
-
 log = logging.getLogger("discover")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 NETWORK_MAP = Path(__file__).parent / "network-map.yaml"
+NETWORK_MAP_JSON = Path(__file__).parent / "network-map.json"  # fallback
 LIVE_NODES_OUT = Path(__file__).parent / "live-nodes.json"
 PROBE_INTERVAL = int(os.environ.get("DISCOVER_INTERVAL", "30"))  # seconds
 
 
+# ---------------------------------------------------------------------------
+# FIX: auto-install pyyaml instead of hard-exiting
+# ---------------------------------------------------------------------------
+def _ensure_yaml():
+    try:
+        import yaml
+        return yaml
+    except ImportError:
+        log.info("pyyaml not found — attempting auto-install via pip...")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", "pyyaml"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            import yaml
+            log.info("pyyaml installed successfully.")
+            return yaml
+        except Exception as e:
+            log.warning("pyyaml auto-install failed: %s", e)
+            return None
+
+
 def load_network_map() -> dict:
-    if not NETWORK_MAP.exists():
-        log.error("network-map.yaml not found at %s", NETWORK_MAP)
-        sys.exit(1)
-    if _YAML:
-        with open(NETWORK_MAP) as f:
-            return yaml.safe_load(f)
-    # Fallback: minimal JSON-ish parsing not implemented — require pyyaml
-    log.error("pyyaml not installed. Run: pip install pyyaml")
+    """Load network-map.yaml (preferred) or network-map.json (fallback)."""
+    yaml = _ensure_yaml()
+
+    # Try YAML first
+    if NETWORK_MAP.exists():
+        if yaml:
+            with open(NETWORK_MAP) as f:
+                data = yaml.safe_load(f)
+            if data:
+                return data
+        else:
+            log.warning("pyyaml unavailable — cannot parse network-map.yaml.")
+            log.warning("Either install pyyaml manually: pip install pyyaml")
+            log.warning("Or create cluster/network-map.json (see network-map.json.example)")
+
+    # Try JSON fallback
+    if NETWORK_MAP_JSON.exists():
+        log.info("Loading network-map.json (YAML fallback)")
+        with open(NETWORK_MAP_JSON) as f:
+            return json.load(f)
+
+    log.error("No network map found. Expected: %s", NETWORK_MAP)
+    log.error("Run: pip install pyyaml  OR  create cluster/network-map.json")
     sys.exit(1)
 
 
 def probe_node(node: dict, timeout: int = 4) -> dict:
-    """
-    Probes a node's Ollama API for health and available models.
-    Returns enriched node dict with 'status', 'models', 'latency_ms'.
-    """
     ip = node["ip"]
     port = node.get("ollama_port", 11434)
     base_url = f"http://{ip}:{port}"
@@ -57,14 +88,13 @@ def probe_node(node: dict, timeout: int = 4) -> dict:
 
     try:
         t0 = time.monotonic()
-        # Health check
         req = urllib.request.Request(f"{base_url}/api/tags", method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
         latency = int((time.monotonic() - t0) * 1000)
         models = [m["name"] for m in data.get("models", [])]
-        result.update({"status": "online", "models": models, "latency_ms": latency,
-                       "base_url": base_url})
+        result.update({"status": "online", "models": models,
+                       "latency_ms": latency, "base_url": base_url})
         log.info("  ✓ %s (%s) — %d models, %dms", node["name"], ip, len(models), latency)
     except urllib.error.URLError:
         log.info("  ✗ %s (%s) — offline", node["name"], ip)
@@ -75,17 +105,14 @@ def probe_node(node: dict, timeout: int = 4) -> dict:
 
 
 def discover_once(network_map: dict) -> dict:
-    """Probes all enabled nodes and returns the live capability map."""
     nodes = [n for n in network_map.get("nodes", []) if n.get("enabled", True)]
     log.info("Probing %d node(s)...", len(nodes))
 
     results = [probe_node(n) for n in nodes]
-
-    online = [r for r in results if r["status"] == "online"]
+    online  = [r for r in results if r["status"] == "online"]
     offline = [r for r in results if r["status"] != "online"]
 
-    # Sort online nodes by profile priority: primary > secondary > thin
-    priority = {"primary": 0, "secondary": 1, "thin-worker": 2}
+    priority = {"primary": 0, "secondary": 1, "thin-worker": 2, "qnap": 3, "windows-thin": 3}
     online.sort(key=lambda n: priority.get(n.get("profile", "thin-worker"), 9))
 
     live_map = {
@@ -105,7 +132,6 @@ def discover_once(network_map: dict) -> dict:
 
 
 def daemon_loop():
-    """Runs discover_once every PROBE_INTERVAL seconds."""
     network_map = load_network_map()
     log.info("Discovery daemon starting. Interval: %ds", PROBE_INTERVAL)
     while True:
@@ -119,8 +145,7 @@ def daemon_loop():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="local-ai-stack node discovery")
     parser.add_argument("--once", action="store_true", help="Probe once and exit")
-    parser.add_argument("--interval", type=int, default=PROBE_INTERVAL,
-                        help=f"Probe interval in seconds (default {PROBE_INTERVAL})")
+    parser.add_argument("--interval", type=int, default=PROBE_INTERVAL)
     args = parser.parse_args()
     PROBE_INTERVAL = args.interval
 
