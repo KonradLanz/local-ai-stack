@@ -1,0 +1,29 @@
+# Environment — NEVER commit secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Logs
+logs/
+*.log
+
+# Docker
+.docker/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IPR filter blocked-query log (local only, privacy sensitive)
+data/ipr_blocked.log
+data/
+
+# Editor
+.vscode/
+.idea/
+*.swp
