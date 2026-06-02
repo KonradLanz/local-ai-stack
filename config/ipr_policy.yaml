@@ -1,0 +1,65 @@
+# IPR Privacy Policy Configuration
+# local-ai-stack — Copyright 2026 GrEEV.com KG
+#
+# This file controls what the ipr_filter blocks or redacts before
+# any query leaves your machine to a public AI API.
+#
+# Sensitivity levels:
+#   low    — only hard block credentials/tokens
+#   medium — block credentials + redact emails (default)
+#   high   — also block queries with 'internal', 'confidential', etc.
+
+sensitivity: medium
+
+# Queries matching ANY of these regex patterns are BLOCKED entirely.
+# The query is never sent externally. Add your own patterns below.
+block_patterns:
+  # Financial credentials
+  - '\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b'   # Card numbers
+  - '\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b'               # IBAN
+  - '\b\d{3}-\d{2}-\d{4}\b'                           # US SSN
+
+  # Credentials & secrets
+  - 'password\s*[:=]\s*\S+'
+  - 'api[_-]?key\s*[:=]\s*\S+'
+  - 'secret\s*[:=]\s*\S+'
+  - 'bearer\s+[a-z0-9_.\-]+'
+  - 'private[_-]?key'
+  - 'access[_-]?token\s*[:=]'
+
+  # Austrian/EU specific (add your own)
+  # - '\bSV-Nummer\b'     # Austrian social insurance number
+  # - '\bSteuernummer\b'  # Austrian tax number
+
+# Queries matching these patterns have the match REDACTED (replaced
+# with [REDACTED]) and then sent with the redacted version.
+redact_patterns:
+  - '\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Z|a-z]{2,}\b'   # Email addresses
+  # - '\b\+?[0-9][\s\-]?[0-9]{3,14}\b'   # Phone numbers (uncomment if needed)
+
+# Set to true to route borderline queries (those that were redacted but
+# not blocked) through your local Ollama model for final classification.
+# Adds ~1-2s latency per query. Requires Ollama running.
+use_local_llm_for_borderline: false
+
+# Log blocked queries to a local file (never sent anywhere).
+# Path is relative to repo root. Covered by .gitignore.
+log_blocked: true
+log_path: data/ipr_blocked.log
+
+# Organization-specific patterns (examples, disabled by default)
+# Add your internal project names, codenames, or classification markers.
+custom_block_patterns: []
+  # - 'Project\s+Codename\s+\w+'
+  # - '\bINTERNAL USE ONLY\b'
+  # - 'GrEEV[_\s-]\w+'
+
+# ---------------------------------------------------------------------------
+# IPR Policy Statement
+# ---------------------------------------------------------------------------
+# This filter implements a basic Information Privacy & Rights (IPR) policy
+# layer. It is NOT a substitute for proper data governance, GDPR compliance,
+# or legal counsel. It provides a best-effort technical barrier against
+# accidental disclosure of sensitive data to public AI services.
+#
+# See docs/IPR-POLICY.md for the full policy framework and GDPR notes.
