@@ -8,14 +8,13 @@
 #    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 #    .\windows\install.ps1
 #
+#  Idempotent: kann beliebig oft ausgefuehrt werden ohne Reinstallationen
 #  SPDX-License-Identifier: (AGPL-3.0-or-later OR MIT)
 # ================================================================
 #Requires -Version 5.1
 
-# UTF-8 fix (wichtig fuer Windows Terminal / PS5.1)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# Alle PS1-Dateien im Verzeichnis entsperren (Download-Blocker)
 try {
     if ($PSScriptRoot) {
         Get-ChildItem -Path $PSScriptRoot -Filter *.ps1 -ErrorAction SilentlyContinue |
@@ -29,6 +28,7 @@ $ErrorActionPreference = "Stop"
 # ---- Hilfsfunktionen ----
 function Write-Step { param([string]$msg) Write-Host "" ; Write-Host ">> $msg" -ForegroundColor Cyan }
 function Write-Ok   { param([string]$msg) Write-Host "   OK  $msg" -ForegroundColor Green }
+function Write-Skip { param([string]$msg) Write-Host "   --  $msg" -ForegroundColor DarkGray }
 function Write-Warn { param([string]$msg) Write-Host "   WARN  $msg" -ForegroundColor Yellow }
 function Write-Fail { param([string]$msg) Write-Host "   FAIL  $msg" -ForegroundColor Red }
 
@@ -41,26 +41,41 @@ function Test-RealPython {
     param([string]$cmd)
     $found = Get-Command $cmd -ErrorAction SilentlyContinue
     if (-not $found) { return "" }
-
-    # Windows Store Stub liegt in WindowsApps - fruehzeitig aussortieren
-    $cmdPath = $found.Source
-    if ($cmdPath -like "*WindowsApps*") {
-        return ""
-    }
-
-    # Aufruf in eigenem ErrorAction-Scope damit NativeCommandError nicht stoppt
+    if ($found.Source -like "*WindowsApps*") { return "" }
     $oldPref = $ErrorActionPreference
     $ErrorActionPreference = "SilentlyContinue"
     $ver = ""
     try {
         $output = (& $cmd --version 2>&1)
-        # Store-Stub gibt deutschen Hinweistext zurueck, kein "Python 3.x"
         if ($output -match "^Python 3\.(1[0-9]|[89])") {
             $ver = $output.ToString().Trim()
         }
     } catch { }
     $ErrorActionPreference = $oldPref
     return $ver
+}
+
+# ----------------------------------------------------------------
+# Prueft ob ein Ollama-Modell lokal vorhanden ist
+# (ollama list gibt Tabelle aus - wir suchen den Modell-Namen)
+# ----------------------------------------------------------------
+function Test-OllamaModel {
+    param([string]$modelName)
+    $oldPref = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    $found = $false
+    try {
+        $list = (ollama list 2>&1)
+        # ollama list gibt Zeilen wie: "qwen2.5:1.5b   abc123   986 MB   2 hours ago"
+        foreach ($line in $list) {
+            if ($line -match ("^" + [regex]::Escape($modelName))) {
+                $found = $true
+                break
+            }
+        }
+    } catch { }
+    $ErrorActionPreference = $oldPref
+    return $found
 }
 
 # ---- Header ----
@@ -70,7 +85,7 @@ Write-Host "  local-ai-stack  Windows Bootstrap" -ForegroundColor Cyan
 Write-Host "  Ziel: Ollama + Python + Modelle fuer 8 GB RAM / 2 GB VRAM" -ForegroundColor Cyan
 Write-Host "================================================================" -ForegroundColor Cyan
 
-# ---- ExecutionPolicy pruefen ----
+# ---- ExecutionPolicy ----
 Write-Step "ExecutionPolicy pruefen"
 $machinePolicy = Get-ExecutionPolicy -Scope MachinePolicy -ErrorAction SilentlyContinue
 if ($machinePolicy -eq "Restricted") {
@@ -83,25 +98,25 @@ if ($currentPolicy -eq "Restricted" -or $currentPolicy -eq "Undefined") {
     Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
     Write-Ok "ExecutionPolicy = RemoteSigned"
 } else {
-    Write-Ok "ExecutionPolicy = $currentPolicy"
+    Write-Skip "ExecutionPolicy = $currentPolicy (ok)"
 }
 
-# ---- Winget pruefen ----
+# ---- Winget ----
 Write-Step "Winget pruefen"
 $wingetCmd = Get-Command winget -ErrorAction SilentlyContinue
 if ($wingetCmd) {
     $wgver = (winget --version 2>&1)
-    Write-Ok "winget $wgver"
+    Write-Skip "winget $wgver (bereits vorhanden)"
 } else {
     Write-Warn "winget nicht gefunden - https://aka.ms/getwinget"
 }
 
-# ---- Ollama pruefen / installieren ----
+# ---- Ollama ----
 Write-Step "Ollama pruefen / installieren"
 $ollamaCmd = Get-Command ollama -ErrorAction SilentlyContinue
 if ($ollamaCmd) {
     $ollamaVer = (ollama --version 2>&1)
-    Write-Ok "Ollama bereits installiert: $ollamaVer"
+    Write-Skip "Ollama $ollamaVer (bereits installiert)"
 } else {
     Write-Host "   Ollama nicht gefunden. Installiere via winget..."
     if ($wingetCmd) {
@@ -113,52 +128,43 @@ if ($ollamaCmd) {
         } catch {
             Write-Warn "winget fehlgeschlagen."
             Write-Host "   Manuell: https://ollama.com/download/OllamaSetup.exe"
-            Write-Host "   Danach dieses Skript erneut ausfuehren."
             exit 1
         }
     } else {
-        Write-Fail "winget nicht verfuegbar. Bitte Ollama manuell installieren:"
-        Write-Host "   https://ollama.com/download/OllamaSetup.exe"
+        Write-Fail "winget nicht verfuegbar."
+        Write-Host "   Manuell: https://ollama.com/download/OllamaSetup.exe"
         exit 1
     }
 }
 
-# ---- Python pruefen / installieren ----
-# Hinweis: Windows 10/11 hat einen Store-Stub python.exe in WindowsApps
-# der keinen echten Interpreter startet sondern nur den Store oeffnet.
-# Test-RealPython filtert diesen Stub heraus.
-Write-Step "Python pruefen"
+# ---- Python ----
+# Windows 10/11 Store-Stub (WindowsApps\python.exe) wird herausgefiltert
+Write-Step "Python pruefen / installieren"
 $py = ""
 foreach ($cmd in @("python3", "python", "py")) {
     $ver = Test-RealPython $cmd
     if ($ver -ne "") {
         $py = $cmd
-        Write-Ok "$cmd => $ver"
+        Write-Skip "$cmd => $ver (bereits installiert)"
         break
     }
 }
 
 if ($py -eq "") {
-    Write-Warn "Kein echter Python 3.8+ Interpreter gefunden (Store-Stub zaehlt nicht)."
-    Write-Host "   Installiere Python 3.11 via winget..."
+    Write-Host "   Kein echter Python 3.8+ Interpreter gefunden. Installiere Python 3.11..."
     if ($wingetCmd) {
         try {
-            # AddToPath=1 damit python.exe nach Install im PATH steht
             winget install -e --id Python.Python.3.11 --silent `
                 --accept-package-agreements --accept-source-agreements `
                 --override "/quiet InstallAllUsers=0 PrependPath=1 Include_pip=1"
-            # PATH in dieser Session sofort aktualisieren
             $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" +
                         [System.Environment]::GetEnvironmentVariable("PATH", "User")
-            # Kurz warten bis Installer fertig geschrieben hat
             Start-Sleep -Seconds 3
-            # Nochmal pruefen
             $ver = Test-RealPython "python"
             if ($ver -ne "") {
                 $py = "python"
                 Write-Ok "Python installiert: $ver"
             } else {
-                # PATH-Reload hat nicht gereicht - Fallback auf py.exe launcher
                 $ver = Test-RealPython "py"
                 if ($ver -ne "") {
                     $py = "py"
@@ -166,7 +172,6 @@ if ($py -eq "") {
                 } else {
                     Write-Warn "Python installiert aber noch nicht im PATH."
                     Write-Warn "Bitte PowerShell-Fenster schliessen, neu oeffnen und Skript erneut ausfuehren."
-                    Write-Host "   (winget hat Python nach C:\Users\<name>\AppData\Local\Programs\Python\Python311 installiert)"
                     exit 0
                 }
             }
@@ -177,21 +182,31 @@ if ($py -eq "") {
             exit 1
         }
     } else {
-        Write-Fail "winget nicht verfuegbar. Bitte Python manuell installieren:"
-        Write-Host "   https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
-        Write-Host "   Wichtig: Haken bei 'Add Python to PATH' setzen!"
+        Write-Fail "winget nicht verfuegbar."
+        Write-Host "   Manuell: https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
         exit 1
     }
 }
 
-# ---- pip + Basis-Pakete ----
-Write-Step "pip und Basis-Pakete installieren"
+# ---- pip + Basis-Pakete (idempotent: nur installieren wenn fehlen) ----
+Write-Step "pip und Basis-Pakete pruefen"
 try {
-    & $py -m pip install --upgrade pip --quiet
-    & $py -m pip install requests httpx --quiet
-    Write-Ok "pip, requests, httpx aktuell."
+    # pip selbst aktualisieren nur wenn noetig (kein --upgrade = kein Netz-Check wenn aktuell)
+    $pipCheck = (& $py -m pip install pip --quiet 2>&1)
+    # requests + httpx: pip installiert nur wenn noch nicht vorhanden
+    $pkgCheck = (& $py -m pip install requests httpx --quiet 2>&1)
+    # Pruefen ob wirklich was installiert wurde oder alles schon da war
+    $installed = @()
+    foreach ($line in $pkgCheck) {
+        if ($line -match "^Successfully installed") { $installed += $line }
+    }
+    if ($installed.Count -gt 0) {
+        Write-Ok "Pakete installiert: $installed"
+    } else {
+        Write-Skip "requests, httpx bereits vorhanden"
+    }
 } catch {
-    Write-Warn "pip-Update fehlgeschlagen (nicht kritisch): $_"
+    Write-Warn "pip-Check fehlgeschlagen (nicht kritisch): $_"
 }
 
 # ---- Repo-Pfad ----
@@ -199,10 +214,10 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 Write-Ok "Repo-Root: $repoRoot"
 
 # ---- Ollama-Server starten (falls noetig) ----
-Write-Step "Ollama-Server starten"
+Write-Step "Ollama-Server pruefen"
 try {
     $null = Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -TimeoutSec 3
-    Write-Ok "Ollama-Server laeuft bereits."
+    Write-Skip "Ollama-Server laeuft bereits."
 } catch {
     Write-Host "   Starte Ollama im Hintergrund..."
     Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Hidden
@@ -210,34 +225,43 @@ try {
     Write-Ok "Ollama gestartet."
 }
 
-# ---- Modelle pullen ----
-Write-Step "Modelle pullen (8 GB RAM / 2 GB VRAM optimiert)"
+# ---- Modelle pullen (nur wenn nicht lokal vorhanden) ----
+Write-Step "Modelle pruefen / pullen"
 
 $modelList = @(
     "qwen2.5:1.5b",
     "phi4-mini"
 )
 $modelReasons = @{
-    "qwen2.5:1.5b" = "Bestes Tool-Calling unter 2 GB RAM - Empfehlung"
+    "qwen2.5:1.5b" = "Bestes Tool-Calling unter 2 GB RAM"
     "phi4-mini"    = "Guter Allrounder ca. 2.5 GB RAM"
 }
 
 foreach ($modelName in $modelList) {
     $reason = $modelReasons[$modelName]
-    Write-Host "   Pulling $modelName  ($reason)..."
-    try {
-        ollama pull $modelName
-        Write-Ok $modelName
-    } catch {
-        Write-Warn "Konnte $modelName nicht pullen: $_"
+    if (Test-OllamaModel $modelName) {
+        Write-Skip "$modelName bereits lokal vorhanden"
+    } else {
+        Write-Host "   Pulling $modelName  ($reason)..."
+        try {
+            ollama pull $modelName
+            Write-Ok "$modelName gepullt."
+        } catch {
+            Write-Warn "Konnte $modelName nicht pullen: $_"
+        }
     }
 }
 
 # ---- LMS_HOST Umgebungsvariable ----
-Write-Step "LMS_HOST setzen (User-scope, permanent)"
-[System.Environment]::SetEnvironmentVariable("LMS_HOST", "http://localhost:11434", "User")
+Write-Step "LMS_HOST pruefen"
+$existingHost = [System.Environment]::GetEnvironmentVariable("LMS_HOST", "User")
+if ($existingHost -eq "http://localhost:11434") {
+    Write-Skip "LMS_HOST bereits gesetzt."
+} else {
+    [System.Environment]::SetEnvironmentVariable("LMS_HOST", "http://localhost:11434", "User")
+    Write-Ok "LMS_HOST=http://localhost:11434"
+}
 $env:LMS_HOST = "http://localhost:11434"
-Write-Ok "LMS_HOST=http://localhost:11434"
 
 # ---- Abschluss ----
 Write-Host ""
