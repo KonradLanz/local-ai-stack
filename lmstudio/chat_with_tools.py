@@ -9,8 +9,10 @@
 #   python3 lmstudio/chat_with_tools.py --debug
 #   PERPLEXITY_API_KEY=pplx-xxx python3 lmstudio/chat_with_tools.py
 #
+# Python 3.8+ kompatibel (from __future__ import annotations)
 # License: AGPL-3.0-or-later OR MIT — Copyright 2026 GrEEV.com KG
 # =============================================================================
+from __future__ import annotations
 import os, sys, json, argparse, datetime, urllib.request, urllib.error
 from pathlib import Path
 
@@ -66,7 +68,7 @@ def post(path: str, payload: dict) -> dict:
 
 def list_models() -> list[str]:
     try:
-        d = get("/v1/models")   # GET, nicht POST!
+        d = get("/v1/models")
         return [m["id"] for m in d.get("data", [])]
     except Exception as e:
         if DEBUG:
@@ -122,7 +124,7 @@ def chat(model: str, messages: list, system: str = "") -> tuple[str, list]:
             for tc in msg.get("tool_calls", []):
                 fn   = tc["function"]["name"]
                 args = json.loads(tc["function"]["arguments"])
-                print(f"\n  {YELLOW}⚙ {fn}{R}({', '.join(f'{k}={repr(v)}' for k,v in args.items())})")
+                print(f"\n  {YELLOW}⚙ {fn}{R}({', '.join(f'{k}={repr(v)}' for k,v in args.items())})") 
                 result = TOOL_MAP[fn](**args) if fn in TOOL_MAP else {"error": f"Unknown tool: {fn}"}
                 if result.get("error"):
                     print(f"  {RED}  ✗ {result['error']}{R}")
@@ -173,9 +175,9 @@ def main():
     search_hint = "Perplexity" if os.environ.get("PERPLEXITY_API_KEY") else "DuckDuckGo"
 
     print()
-    print(f"{BOLD}╔══════════════════════════════════════════════════╗{R}")
+    print(f"{BOLD}╔════════════════════════════════════════════════╗{R}")
     print(f"{BOLD}║  LM Studio CLI Chat  +Tools                      ║{R}")
-    print(f"{BOLD}╚══════════════════════════════════════════════════╝{R}")
+    print(f"{BOLD}╚════════════════════════════════════════════════╝{R}")
     print(f"  Modell : {CYAN}{model}{R}")
     print(f"  Tools  : {GREEN}fetch_url  web_search ({search_hint}){R}")
     print(f"  Host   : {DIM}{LMS_HOST}{R}")
