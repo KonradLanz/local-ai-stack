@@ -2,8 +2,10 @@
 # lmstudio/tools/fetch_url.py
 # Tool: fetch the readable text content of a URL (strips HTML tags)
 # Used by chat_with_tools.py as an OpenAI function-calling tool.
+# Python 3.8+ kompatibel (from __future__ import annotations)
 # License: AGPL-3.0-or-later OR MIT — Copyright 2026 GrEEV.com KG
 # =============================================================================
+from __future__ import annotations
 import urllib.request, urllib.error, re, json
 from typing import Any
 
@@ -31,16 +33,12 @@ DEFINITION = {
 
 
 def _strip_html(html: str) -> str:
-    """Very lightweight HTML → plain text (no dependencies)."""
-    # Remove scripts and style blocks
+    """Very lightweight HTML -> plain text (no dependencies)."""
     html = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', html, flags=re.S | re.I)
-    # Remove tags
     html = re.sub(r'<[^>]+>', ' ', html)
-    # Decode common entities
     for ent, char in [('&amp;','&'),('&lt;','<'),('&gt;','>'),
                       ('&nbsp;',' '),('&quot;','"'),('&#39;',"'")]:
         html = html.replace(ent, char)
-    # Collapse whitespace
     html = re.sub(r'[ \t]+', ' ', html)
     html = re.sub(r'\n{3,}', '\n\n', html)
     return html.strip()
@@ -62,12 +60,12 @@ def run(url: str, max_chars: int = 3000) -> dict[str, Any]:
                 charset = ct
             html = resp.read().decode(charset, errors="replace")
 
-        # Extract title
         title_m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.I)
         title = title_m.group(1).strip() if title_m else url
 
-        text = _strip_html(html)[:max_chars]
-        if len(_strip_html(html)) > max_chars:
+        full_text = _strip_html(html)
+        text = full_text[:max_chars]
+        if len(full_text) > max_chars:
             text += f"\n\n[... truncated at {max_chars} chars ...]"
 
         return {"url": url, "title": title, "text": text, "error": None}

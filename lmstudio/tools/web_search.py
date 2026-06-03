@@ -2,8 +2,10 @@
 # lmstudio/tools/web_search.py
 # Tool: DuckDuckGo Instant Answer + HTML scrape (no API key needed)
 # For Perplexity Search API: set PERPLEXITY_API_KEY env var.
+# Python 3.8+ kompatibel (from __future__ import annotations)
 # License: AGPL-3.0-or-later OR MIT — Copyright 2026 GrEEV.com KG
 # =============================================================================
+from __future__ import annotations
 import os, urllib.request, urllib.parse, re, json
 from typing import Any
 
@@ -47,14 +49,12 @@ def _ddg_search(query: str, max_results: int = 5) -> list[dict]:
         html = resp.read().decode("utf-8", errors="replace")
 
     results = []
-    # Parse result blocks
     blocks = re.findall(
         r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>([^<]+)</a>.*?'
         r'<a[^>]+class="result__snippet"[^>]*>([^<]*(?:<[^>]+>[^<]*)*)</a>',
         html, re.S
     )
     for href, title, snippet in blocks[:max_results]:
-        # DDG redirects: extract actual URL
         qs = urllib.parse.urlparse(href).query
         params = urllib.parse.parse_qs(qs)
         actual_url = params.get("uddg", [href])[0]
