@@ -9,7 +9,7 @@
 #   LMS_HOST=http://192.168.1.10:1234 bash lmstudio/chat.sh
 #
 # Commands during chat:
-#   /exit  /quit  /bye   — end session
+#   /exit  /quit  /bye   — end session (auto-saves)
 #   /new                 — clear history, start fresh
 #   /model               — show current model
 #   /models              — list all loaded models
@@ -23,48 +23,45 @@
 set -euo pipefail
 
 LMS_HOST="${LMS_HOST:-http://localhost:1234}"
-LOG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../logs" 2>/dev/null && pwd || echo "${HOME}/.local/share/lmstudio-chats")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="$SCRIPT_DIR/../logs"
 mkdir -p "$LOG_DIR"
+LOG_DIR="$(cd "$LOG_DIR" && pwd)"
 
-# Colors
 RESET="\033[0m"; BOLD="\033[1m"; DIM="\033[2m"
 CYAN="\033[0;36m"; GREEN="\033[0;32m"; YELLOW="\033[1;33m"
 BLUE="\033[0;34m"; MAGENTA="\033[0;35m"; RED="\033[0;31m"
 
-die() { echo -e "${RED}Error: $*${RESET}" >&2; exit 1; }
-
 # ---------------------------------------------------------------------------
-# Fetch loaded models from LM Studio
+# Fetch loaded models
 # ---------------------------------------------------------------------------
 fetch_models() {
   curl -sf --max-time 5 "$LMS_HOST/v1/models" \
     -H "Content-Type: application/json" 2>/dev/null \
   | python3 -c "
 import json,sys
-d=json.load(sys.stdin)
-for m in d.get('data',[]): print(m['id'])
+for m in json.load(sys.stdin).get('data',[]): print(m['id'])
 " 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
-# Interactive model picker
+# Model picker
 # ---------------------------------------------------------------------------
 pick_model() {
   local models
   mapfile -t models < <(fetch_models)
   if [ ${#models[@]} -eq 0 ]; then
-    echo -e "${RED}No models loaded in LM Studio.${RESET}"
-    echo -e "${DIM}Open LM Studio → load a model → Developer → Start Server${RESET}"
+    echo -e "${RED}No models loaded in LM Studio.${RESET}" >&2
+    echo -e "${DIM}LM Studio → load a model → Developer → Start Server${RESET}" >&2
     exit 1
   fi
   if [ ${#models[@]} -eq 1 ]; then
-    echo "${models[0]}"
-    return
+    echo "${models[0]}"; return
   fi
   echo -e "\n${BOLD}Available models:${RESET}" >&2
   local i=1
   for m in "${models[@]}"; do
-    echo -e "  ${CYAN}$i)${RESET} $m" >&2
+    printf "  ${CYAN}%2d)${RESET} %s\n" "$i" "$m" >&2
     i=$((i+1))
   done
   echo >&2
@@ -73,27 +70,27 @@ pick_model() {
     read -r choice
     choice="${choice:-1}"
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#models[@]}" ]; then
-      echo "${models[$((choice-1))]}"
-      return
+      echo "${models[$((choice-1))]}"; return
     fi
-    echo -e "  ${YELLOW}Enter a number between 1 and ${#models[@]}${RESET}" >&2
+    echo -e "  ${YELLOW}Enter a number 1–${#models[@]}${RESET}" >&2
   done
 }
 
 # ---------------------------------------------------------------------------
-# Stream one assistant turn, return full text
+# Stream one turn — tokens print directly to terminal, reply saved to tmpfile
 # ---------------------------------------------------------------------------
+REPLY_FILE="${TMPDIR:-/tmp}/lms-reply-$$.txt"
+
 chat_turn() {
   local model="$1" messages_json="$2" system_prompt="$3"
+  : > "$REPLY_FILE"
 
-  # Build message array with optional system prompt
   local full_messages
   full_messages=$(python3 -c "
 import json,sys
 msgs=json.loads(sys.argv[1])
-sys_p=sys.argv[2]
-if sys_p:
-    msgs=[{'role':'system','content':sys_p}]+msgs
+sp=sys.argv[2]
+if sp: msgs=[{'role':'system','content':sp}]+msgs
 print(json.dumps(msgs))
 " "$messages_json" "$system_prompt")
 
@@ -109,32 +106,51 @@ print(json.dumps({
 }))
 " "$model" "$full_messages")
 
-  # Stream with SSE parsing — print tokens as they arrive
-  local full_reply=""
-  echo -e -n "${GREEN}"
-  while IFS= read -r line; do
-    [[ "$line" == data:* ]] || continue
-    local data="${line#data: }"
-    [ "$data" = "[DONE]" ] && break
-    local token
-    token=$(python3 -c "
-import json,sys
+  # Use python3 for the entire SSE loop — prints tokens immediately to tty,
+  # also writes full reply to REPLY_FILE so bash can read it back.
+  python3 - "$payload" "$REPLY_FILE" <<'PYEOF'
+import sys, json, subprocess, os
+
+payload   = sys.argv[1]
+reply_file= sys.argv[2]
+lms_host  = os.environ.get("LMS_HOST","http://localhost:1234")
+
+cmd = [
+    "curl", "-sN", "--max-time", "180",
+    f"{lms_host}/v1/chat/completions",
+    "-H", "Content-Type: application/json",
+    "-d", payload
+]
+
+full = []
 try:
-    d=json.loads(sys.argv[1])
-    t=d['choices'][0]['delta'].get('content','')
-    sys.stdout.write(t)
-except: pass
-" "$data" 2>/dev/null || true)
-    full_reply+="$token"
-  done < <(curl -sN --max-time 120 "$LMS_HOST/v1/chat/completions" \
-    -H "Content-Type: application/json" \
-    -d "$payload" 2>/dev/null)
-  echo -e "${RESET}"
-  echo "$full_reply"
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    for raw in proc.stdout:
+        line = raw.decode("utf-8", errors="replace").rstrip()
+        if not line.startswith("data:"): continue
+        data = line[5:].strip()
+        if data == "[DONE]": break
+        try:
+            token = json.loads(data)["choices"][0]["delta"].get("content","")
+            if token:
+                sys.stdout.write(token)
+                sys.stdout.flush()
+                full.append(token)
+        except Exception:
+            pass
+    proc.wait()
+except Exception as e:
+    sys.stdout.write(f"\n[error: {e}]")
+
+sys.stdout.write("\n")
+sys.stdout.flush()
+with open(reply_file, "w") as f:
+    f.write("".join(full))
+PYEOF
 }
 
 # ---------------------------------------------------------------------------
-# Save chat to JSON
+# Save chat
 # ---------------------------------------------------------------------------
 save_chat() {
   local model="$1" messages_json="$2" file="$3"
@@ -151,18 +167,20 @@ print(json.dumps({
   echo -e "  ${GREEN}Saved: $file${RESET}"
 }
 
+cleanup() { rm -f "$REPLY_FILE"; }
+trap cleanup EXIT
+
 # ---------------------------------------------------------------------------
-# --list flag
+# --list
 # ---------------------------------------------------------------------------
 if [ "${1:-}" = "--list" ]; then
   echo -e "\n${BOLD}Loaded models at $LMS_HOST:${RESET}"
   fetch_models | while read -r m; do echo "  $m"; done
-  echo
-  exit 0
+  echo; exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# Main: pick model, start session
+# Pick model
 # ---------------------------------------------------------------------------
 if [ -n "${1:-}" ] && [[ "${1:-}" != --* ]]; then
   MODEL="$1"
@@ -174,23 +192,24 @@ SYSTEM_PROMPT=""
 MESSAGES="[]"
 SESSION_START=$(date +%Y%m%d-%H%M%S)
 
-clear
+echo
 echo -e "${BOLD}╔══════════════════════════════════════════════════╗${RESET}"
 echo -e "${BOLD}║  LM Studio CLI Chat                              ║${RESET}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════╝${RESET}"
 echo -e "  Model : ${CYAN}$MODEL${RESET}"
 echo -e "  Host  : ${DIM}$LMS_HOST${RESET}"
 echo -e "  Logs  : ${DIM}$LOG_DIR${RESET}"
-echo -e "  ${DIM}Type /help for commands, /exit to quit${RESET}"
+echo -e "  ${DIM}/help für Befehle  •  /exit zum Beenden${RESET}"
 echo
 
+# ---------------------------------------------------------------------------
+# Chat loop
+# ---------------------------------------------------------------------------
 while true; do
-  # Prompt
   printf "${BOLD}${BLUE}you${RESET} ${DIM}>>${RESET} "
   IFS= read -r user_input || break
   [ -z "$user_input" ] && continue
 
-  # Commands
   case "$user_input" in
     /exit|/quit|/bye)
       echo -e "\n${DIM}Session ended. Auf Wiedersehen!${RESET}"
@@ -201,37 +220,38 @@ while true; do
       echo -e "  ${YELLOW}History cleared.${RESET}\n"
       continue ;;
     /model)
-      echo -e "  ${CYAN}$MODEL${RESET}\n"
-      continue ;;
+      echo -e "  ${CYAN}$MODEL${RESET}\n"; continue ;;
     /models)
       echo
       fetch_models | while read -r m; do
-        [ "$m" = "$MODEL" ] && echo -e "  ${GREEN}▶ $m${RESET}" || echo "    $m"
+        [ "$m" = "$MODEL" ] \
+          && echo -e "  ${GREEN}▶ $m  (active)${RESET}" \
+          || echo "    $m"
       done
       echo; continue ;;
     /system*)
       SYSTEM_PROMPT="${user_input#/system }"
-      echo -e "  ${YELLOW}System prompt set.${RESET}\n"
+      echo -e "  ${YELLOW}System prompt set: ${DIM}$SYSTEM_PROMPT${RESET}\n"
       continue ;;
     /save*)
-      savefile="${user_input#/save}"; savefile="${savefile## }"
-      save_chat "$MODEL" "$MESSAGES" "${savefile:-}"
+      sf="${user_input#/save}"; sf="${sf## }"
+      save_chat "$MODEL" "$MESSAGES" "${sf:-}"
       echo; continue ;;
     /help)
       echo -e "
-  ${BOLD}Commands:${RESET}
-    ${CYAN}/exit /quit /bye${RESET}   — end session (auto-saves)
-    ${CYAN}/new${RESET}               — clear history
-    ${CYAN}/model${RESET}             — show current model
-    ${CYAN}/models${RESET}            — list all loaded models
-    ${CYAN}/system <text>${RESET}     — set system prompt
-    ${CYAN}/save [file]${RESET}       — save chat to JSON
-    ${CYAN}/help${RESET}              — this message
+  ${BOLD}Befehle:${RESET}
+    ${CYAN}/exit /quit /bye${RESET}     — beenden (speichert automatisch)
+    ${CYAN}/new${RESET}                 — History löschen
+    ${CYAN}/model${RESET}               — aktives Modell anzeigen
+    ${CYAN}/models${RESET}              — alle geladenen Modelle
+    ${CYAN}/system <text>${RESET}       — System-Prompt setzen
+    ${CYAN}/save [datei]${RESET}        — Chat als JSON speichern
+    ${CYAN}/help${RESET}                — diese Hilfe
 "
       continue ;;
   esac
 
-  # Append user message
+  # Append user turn
   MESSAGES=$(python3 -c "
 import json,sys
 msgs=json.loads(sys.argv[1])
@@ -239,19 +259,21 @@ msgs.append({'role':'user','content':sys.argv[2]})
 print(json.dumps(msgs))
 " "$MESSAGES" "$user_input")
 
-  # Assistant header
-  echo -e "${BOLD}${MAGENTA}$(echo "$MODEL" | sed 's|.*/||')${RESET} ${DIM}>>${RESET} "
+  # Print assistant label, then stream
+  short_model=$(echo "$MODEL" | sed 's|.*/||')
+  printf "${BOLD}${MAGENTA}%s${RESET} ${DIM}>>${RESET} " "$short_model"
 
-  # Stream response
-  REPLY=$(chat_turn "$MODEL" "$MESSAGES" "$SYSTEM_PROMPT")
+  LMS_HOST="$LMS_HOST" chat_turn "$MODEL" "$MESSAGES" "$SYSTEM_PROMPT"
 
-  # Append assistant message
-  MESSAGES=$(python3 -c "
+  # Read reply from tmpfile, append to history
+  REPLY=$(<"$REPLY_FILE")
+  if [ -n "$REPLY" ]; then
+    MESSAGES=$(python3 -c "
 import json,sys
 msgs=json.loads(sys.argv[1])
 msgs.append({'role':'assistant','content':sys.argv[2]})
 print(json.dumps(msgs))
 " "$MESSAGES" "$REPLY")
-
+  fi
   echo
 done
