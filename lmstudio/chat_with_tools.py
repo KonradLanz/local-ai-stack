@@ -4,17 +4,25 @@
 # CLI chat mit tool-calling: fetch_url + web_search
 #
 # Usage:
-#   python3 lmstudio/chat_with_tools.py
-#   python3 lmstudio/chat_with_tools.py --model yoyo
-#   python3 lmstudio/chat_with_tools.py --debug
-#   PERPLEXITY_API_KEY=pplx-xxx python3 lmstudio/chat_with_tools.py
+#   python lmstudio/chat_with_tools.py
+#   python lmstudio/chat_with_tools.py --model qwen2.5
+#   python lmstudio/chat_with_tools.py --debug
+#   PERPLEXITY_API_KEY=pplx-xxx python lmstudio/chat_with_tools.py
 #
-# Python 3.8+ kompatibel (from __future__ import annotations)
-# License: AGPL-3.0-or-later OR MIT — Copyright 2026 GrEEV.com KG
+# Python 3.8+ kompatibel
+# License: AGPL-3.0-or-later OR MIT - Copyright 2026 GrEEV.com KG
 # =============================================================================
 from __future__ import annotations
 import os, sys, json, argparse, datetime, urllib.request, urllib.error
 from pathlib import Path
+
+# UTF-8 stdout erzwingen (wichtig fuer Windows cp1252 / Python 3.8-32bit)
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 
 SCRIPT_DIR = Path(__file__).parent
 LOG_DIR = SCRIPT_DIR.parent / "logs"
@@ -23,9 +31,34 @@ LOG_DIR.mkdir(exist_ok=True)
 LMS_HOST = os.environ.get("LMS_HOST", "http://localhost:1234")
 DEBUG = False
 
+# Timeouts
+TIMEOUT_LLM   = int(os.environ.get("LMS_TIMEOUT", "300"))  # 5 min fuer LLM-Antwort
+TIMEOUT_FETCH = 20   # fetch_url / web_search
+TIMEOUT_API   = 10   # /v1/models etc.
+
 R="\033[0m"; BOLD="\033[1m"; DIM="\033[2m"
 CYAN="\033[0;36m"; GREEN="\033[0;32m"; YELLOW="\033[1;33m"
 BLUE="\033[0;34m"; MAGENTA="\033[0;35m"; RED="\033[0;31m"
+
+# ASCII-safe Sonderzeichen (Fallback wenn Terminal kein UTF-8 kann)
+def _safe(s: str) -> str:
+    try:
+        s.encode(sys.stdout.encoding or 'utf-8')
+        return s
+    except (UnicodeEncodeError, LookupError):
+        return (s
+            .replace('\u2554','+')
+            .replace('\u2550','=')
+            .replace('\u2557','+')
+            .replace('\u2551','|')
+            .replace('\u255a','+')
+            .replace('\u255d','+')
+            .replace('\u2713','OK')
+            .replace('\u2717','ERR')
+            .replace('\u2699','*')
+            .replace('\u2014','-')
+            .replace('\u2026','...')
+        )
 
 sys.path.insert(0, str(SCRIPT_DIR))
 from tools import fetch_url, web_search
@@ -35,13 +68,12 @@ TOOL_MAP = {"fetch_url": fetch_url.run, "web_search": web_search.run}
 
 
 def get(path: str) -> dict:
-    """HTTP GET."""
     req = urllib.request.Request(
         f"{LMS_HOST}{path}",
         headers={"Accept": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_API) as r:
             return json.load(r)
     except Exception as e:
         if DEBUG:
@@ -50,7 +82,6 @@ def get(path: str) -> dict:
 
 
 def post(path: str, payload: dict) -> dict:
-    """HTTP POST."""
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         f"{LMS_HOST}{path}",
@@ -58,7 +89,7 @@ def post(path: str, payload: dict) -> dict:
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_LLM) as r:
             return json.load(r)
     except Exception as e:
         if DEBUG:
@@ -79,9 +110,8 @@ def list_models() -> list[str]:
 def pick_model(preferred: str | None) -> str:
     models = list_models()
     if not models:
-        print(f"{RED}Keine Modelle gefunden — Server erreichbar?{R}")
+        print(f"{RED}Keine Modelle gefunden - Server erreichbar?{R}")
         print(f"  {DIM}curl -s {LMS_HOST}/v1/models{R}")
-        print(f"  {DIM}--debug fuer Details{R}")
         sys.exit(1)
     if preferred:
         for m in models:
@@ -111,7 +141,7 @@ def chat(model: str, messages: list, system: str = "") -> tuple[str, list]:
             "tools": TOOLS,
             "tool_choice": "auto",
             "temperature": 0.7,
-            "max_tokens": 4096,
+            "max_tokens": 2048,
             "stream": False,
         })
 
@@ -124,12 +154,12 @@ def chat(model: str, messages: list, system: str = "") -> tuple[str, list]:
             for tc in msg.get("tool_calls", []):
                 fn   = tc["function"]["name"]
                 args = json.loads(tc["function"]["arguments"])
-                print(f"\n  {YELLOW}⚙ {fn}{R}({', '.join(f'{k}={repr(v)}' for k,v in args.items())})") 
+                print(_safe(f"\n  {YELLOW}* {fn}{R}({', '.join(f'{k}={repr(v)}' for k,v in args.items())})"))
                 result = TOOL_MAP[fn](**args) if fn in TOOL_MAP else {"error": f"Unknown tool: {fn}"}
                 if result.get("error"):
-                    print(f"  {RED}  ✗ {result['error']}{R}")
+                    print(_safe(f"  {RED}  ERR {result['error']}{R}"))
                 else:
-                    print(f"  {GREEN}  ✓ {str(result)[:120].replace(chr(10),' ')}…{R}")
+                    print(_safe(f"  {GREEN}  OK  {str(result)[:120].replace(chr(10),' ')}...{R}"))
                 all_messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
@@ -147,7 +177,7 @@ def save(model: str, messages: list, path: Path):
         "lms_host": LMS_HOST,
         "tools": [t["function"]["name"] for t in TOOLS],
         "messages": messages
-    }, ensure_ascii=False, indent=2))
+    }, ensure_ascii=False, indent=2), encoding='utf-8')
     print(f"  {GREEN}Saved: {path}{R}")
 
 
@@ -175,13 +205,14 @@ def main():
     search_hint = "Perplexity" if os.environ.get("PERPLEXITY_API_KEY") else "DuckDuckGo"
 
     print()
-    print(f"{BOLD}╔════════════════════════════════════════════════╗{R}")
-    print(f"{BOLD}║  LM Studio CLI Chat  +Tools                      ║{R}")
-    print(f"{BOLD}╚════════════════════════════════════════════════╝{R}")
-    print(f"  Modell : {CYAN}{model}{R}")
-    print(f"  Tools  : {GREEN}fetch_url  web_search ({search_hint}){R}")
-    print(f"  Host   : {DIM}{LMS_HOST}{R}")
-    print(f"  {DIM}Einfach chatten — Modell ruft Tools selbst auf{R}")
+    print(_safe(f"{BOLD}+================================================+{R}"))
+    print(_safe(f"{BOLD}|  LM Studio CLI Chat  +Tools                    |{R}"))
+    print(_safe(f"{BOLD}+================================================+{R}"))
+    print(f"  Modell  : {CYAN}{model}{R}")
+    print(f"  Tools   : {GREEN}fetch_url  web_search ({search_hint}){R}")
+    print(f"  Host    : {DIM}{LMS_HOST}{R}")
+    print(f"  Timeout : {DIM}{TIMEOUT_LLM}s (LMS_TIMEOUT env zum Aendern){R}")
+    print(f"  {DIM}Einfach chatten - Modell ruft Tools selbst auf{R}")
     print(f"  {DIM}/help  /exit  /new  /system  /save{R}")
     print()
 
@@ -216,17 +247,21 @@ def main():
         elif user_input == "/help":
             print(f"""
   {BOLD}Befehle:{R}
-    {CYAN}/exit /quit /bye{R}     — beenden (speichert)
-    {CYAN}/new{R}                 — History loeschen
-    {CYAN}/system <text>{R}       — System-Prompt
-    {CYAN}/save [datei]{R}        — Chat speichern
+    {CYAN}/exit /quit /bye{R}     - beenden (speichert)
+    {CYAN}/new{R}                 - History loeschen
+    {CYAN}/system <text>{R}       - System-Prompt setzen
+    {CYAN}/save [datei]{R}        - Chat speichern
 
   {BOLD}Tools (automatisch):{R}
-    {GREEN}fetch_url(url){R}      — Webseite lesen
-    {GREEN}web_search(query){R}   — Suchen ({search_hint})
+    {GREEN}fetch_url(url){R}      - Webseite lesen
+    {GREEN}web_search(query){R}   - Suchen ({search_hint})
+
+  {BOLD}Timeout erhoehen:{R}
+    {DIM}set LMS_TIMEOUT=600{R}  (Windows CMD)
+    {DIM}$env:LMS_TIMEOUT=600{R} (PowerShell)
 
   {BOLD}Perplexity aktivieren:{R}
-    {DIM}PERPLEXITY_API_KEY=pplx-xxx python3 lmstudio/chat_with_tools.py{R}
+    {DIM}$env:PERPLEXITY_API_KEY='pplx-xxx'{R}
 """)
             continue
 
@@ -240,6 +275,8 @@ def main():
             print(f"{GREEN}{reply}{R}")
         except Exception as e:
             print(f"\n{RED}Fehler: {e}{R}")
+            if str(e) == "timed out":
+                print(f"  {DIM}Tipp: $env:LMS_TIMEOUT=600 dann neu starten{R}")
             if DEBUG:
                 import traceback; traceback.print_exc()
             messages.pop()

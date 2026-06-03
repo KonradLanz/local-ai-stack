@@ -1,13 +1,16 @@
 # =============================================================================
 # lmstudio/tools/fetch_url.py
 # Tool: fetch the readable text content of a URL (strips HTML tags)
-# Used by chat_with_tools.py as an OpenAI function-calling tool.
-# Python 3.8+ kompatibel (from __future__ import annotations)
-# License: AGPL-3.0-or-later OR MIT — Copyright 2026 GrEEV.com KG
+# Python 3.8+ kompatibel
+# License: AGPL-3.0-or-later OR MIT - Copyright 2026 GrEEV.com KG
 # =============================================================================
 from __future__ import annotations
 import urllib.request, urllib.error, re, json
 from typing import Any
+
+# Timeout fuer URL-Fetches (kann via LMS_FETCH_TIMEOUT env gesetzt werden)
+import os
+FETCH_TIMEOUT = int(os.environ.get("LMS_FETCH_TIMEOUT", "20"))
 
 DEFINITION = {
     "type": "function",
@@ -33,7 +36,6 @@ DEFINITION = {
 
 
 def _strip_html(html: str) -> str:
-    """Very lightweight HTML -> plain text (no dependencies)."""
     html = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', html, flags=re.S | re.I)
     html = re.sub(r'<[^>]+>', ' ', html)
     for ent, char in [('&amp;','&'),('&lt;','<'),('&gt;','>'),
@@ -45,7 +47,6 @@ def _strip_html(html: str) -> str:
 
 
 def run(url: str, max_chars: int = 3000) -> dict[str, Any]:
-    """Fetch URL and return {url, title, text, error}."""
     headers = {
         "User-Agent": "Mozilla/5.0 (local-ai-stack/1.0; +https://github.com/KonradLanz/local-ai-stack)",
         "Accept": "text/html,application/xhtml+xml",
@@ -53,7 +54,7 @@ def run(url: str, max_chars: int = 3000) -> dict[str, Any]:
     }
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
             charset = "utf-8"
             ct = resp.headers.get_content_charset()
             if ct:
