@@ -1,26 +1,23 @@
 """
 mesh/node.py — Per-node mesh daemon
 Runs on every machine. Exposes /mesh/* HTTP endpoints.
-Acts as the local entry point for all AI requests on this machine.
 Copyright 2026 GrEEV.com KG
 
 Endpoints:
   GET  /mesh/status      — node capabilities + load
-  GET  /mesh/nodes       — known mesh nodes (for gossip)
+  GET  /mesh/nodes       — known mesh nodes (gossip)
   POST /mesh/submit      — submit a task to the mesh
   GET  /mesh/suggestions — pending model swap suggestions
   POST /mesh/apply       — accept/reject a suggestion
 
-Submit payload (Ollama-compatible + mesh extensions):
-  { "model": "...", "messages": [...], "_task_type": "code" (optional) }
-
-Dependencies: standard library only (http.server).
+Dependencies: standard library only.
 """
 
 import http.server
 import json
 import logging
 import os
+import socket
 import threading
 import time
 from pathlib import Path
@@ -28,8 +25,8 @@ from pathlib import Path
 log = logging.getLogger("mesh.node")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-REPO_ROOT  = Path(__file__).parent.parent
-MESH_PORT  = int(os.environ.get("MESH_PORT", "11430"))
+REPO_ROOT     = Path(__file__).parent.parent
+MESH_PORT     = int(os.environ.get("MESH_PORT", "11430"))
 _active_tasks = 0
 _active_lock  = threading.Lock()
 
@@ -37,6 +34,15 @@ _active_lock  = threading.Lock()
 def load_hw_profile() -> dict:
     p = REPO_ROOT / "cluster" / "hw-profile.json"
     return json.loads(p.read_text()) if p.exists() else {}
+
+
+class ReuseAddrHTTPServer(http.server.HTTPServer):
+    """HTTPServer with SO_REUSEADDR so restart after crash never hits EADDRINUSE."""
+    allow_reuse_address = True
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        super().server_bind()
 
 
 class MeshHandler(http.server.BaseHTTPRequestHandler):
@@ -77,15 +83,12 @@ class MeshHandler(http.server.BaseHTTPRequestHandler):
         global _active_tasks
         hw = load_hw_profile()
         inference_mb = hw.get("inference_mb", 0)
-        # Rough load: each active task consumes ~30% of inference_mb
         with _active_lock:
             load = min(_active_tasks * 0.30, 1.0)
         available = int(inference_mb * (1.0 - load))
-
         from mesh.specialist import get_specialization_scores
         scores = {s["task_type"]: s["score"]
                   for s in get_specialization_scores(hw.get("node_profile", "unknown"))}
-
         self._json(200, {
             "node_profile":           hw.get("node_profile"),
             "inference_mb":           inference_mb,
@@ -98,21 +101,18 @@ class MeshHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_nodes(self):
         from mesh.state import load_state
-        state = load_state()
-        self._json(200, state.get("nodes", []))
+        self._json(200, load_state().get("nodes", []))
 
     def _handle_submit(self):
         global _active_tasks
-        payload  = self._read_body()
-        prompt   = self._extract_prompt(payload)
+        payload   = self._read_body()
+        prompt    = self._extract_prompt(payload)
         task_type = payload.get("_task_type")
-
         from mesh.scheduler import pick_node, forward_to_node
         node = pick_node(prompt, task_type)
         if not node:
             self._json(503, {"error": "No suitable node available"})
             return
-
         with _active_lock:
             _active_tasks += 1
         t0 = time.monotonic()
@@ -121,22 +121,19 @@ class MeshHandler(http.server.BaseHTTPRequestHandler):
         finally:
             with _active_lock:
                 _active_tasks -= 1
-
         duration_ms = int((time.monotonic() - t0) * 1000)
-
-        # Record for specialization learning
         from mesh.classifier import classify
         from mesh.specialist import record_task, init_db
         init_db()
         classification = classify(prompt)
         tokens = result.get("eval_count", len(prompt) // 4)
         record_task(
-            task_type    = classification["task_type"],
-            routed_to    = node["name"],
-            model        = payload.get("model", "unknown"),
-            prompt_len   = len(prompt),
-            tokens_gen   = tokens,
-            duration_ms  = duration_ms,
+            task_type   = classification["task_type"],
+            routed_to   = node["name"],
+            model       = payload.get("model", "unknown"),
+            prompt_len  = len(prompt),
+            tokens_gen  = tokens,
+            duration_ms = duration_ms,
         )
         self._json(200, result)
 
@@ -146,41 +143,32 @@ class MeshHandler(http.server.BaseHTTPRequestHandler):
         self._json(200, get_pending_suggestions())
 
     def _handle_apply(self):
-        """Accept or reject a model swap suggestion."""
         import sqlite3
         from mesh.specialist import DB_PATH, init_db
         init_db()
         body = self._read_body()
         suggestion_id = body.get("id")
-        action = body.get("action")  # "accept" or "reject"
-
+        action = body.get("action")
         if not suggestion_id or action not in ("accept", "reject"):
             self._json(400, {"error": "id and action (accept|reject) required"})
             return
-
         conn = sqlite3.connect(DB_PATH)
         row = conn.execute(
             "SELECT node, to_model FROM model_suggestions WHERE id=?",
             (suggestion_id,)
         ).fetchone()
-
         if not row:
             conn.close()
             self._json(404, {"error": "suggestion not found"})
             return
-
         node_name, to_model = row
         status = "accepted" if action == "accept" else "rejected"
         conn.execute("UPDATE model_suggestions SET status=? WHERE id=?",
                      (status, suggestion_id))
         conn.commit()
         conn.close()
-
         if action == "accept":
-            # Trigger model pull in background
-            threading.Thread(
-                target=self._pull_model, args=(to_model,), daemon=True
-            ).start()
+            threading.Thread(target=self._pull_model, args=(to_model,), daemon=True).start()
             self._json(200, {"status": "accepted", "pulling": to_model})
         else:
             self._json(200, {"status": "rejected"})
@@ -193,7 +181,6 @@ class MeshHandler(http.server.BaseHTTPRequestHandler):
 
     @staticmethod
     def _extract_prompt(payload: dict) -> str:
-        """Extract a flat prompt string for classification."""
         msgs = payload.get("messages", [])
         if msgs:
             return " ".join(m.get("content", "") for m in msgs if isinstance(m, dict))
@@ -201,9 +188,14 @@ class MeshHandler(http.server.BaseHTTPRequestHandler):
 
 
 def run(port: int = MESH_PORT):
-    server = http.server.HTTPServer(("", port), MeshHandler)
-    log.info("Mesh node daemon listening on :%d", port)
-    server.serve_forever()
+    server = ReuseAddrHTTPServer(("", port), MeshHandler)
+    log.info("Mesh node listening on :%d (SO_REUSEADDR)", port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log.info("Mesh node shutting down")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
