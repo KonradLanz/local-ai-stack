@@ -32,6 +32,37 @@ function Write-Ok   { param([string]$msg) Write-Host "   OK  $msg" -ForegroundCo
 function Write-Warn { param([string]$msg) Write-Host "   WARN  $msg" -ForegroundColor Yellow }
 function Write-Fail { param([string]$msg) Write-Host "   FAIL  $msg" -ForegroundColor Red }
 
+# ----------------------------------------------------------------
+# Testet ob ein Kommando ein echter Python-Interpreter ist
+# (kein Windows-Store-Stub aus WindowsApps\python.exe)
+# Gibt Versions-String zurueck oder "" wenn Stub/nicht gefunden
+# ----------------------------------------------------------------
+function Test-RealPython {
+    param([string]$cmd)
+    $found = Get-Command $cmd -ErrorAction SilentlyContinue
+    if (-not $found) { return "" }
+
+    # Windows Store Stub liegt in WindowsApps - fruehzeitig aussortieren
+    $cmdPath = $found.Source
+    if ($cmdPath -like "*WindowsApps*") {
+        return ""
+    }
+
+    # Aufruf in eigenem ErrorAction-Scope damit NativeCommandError nicht stoppt
+    $oldPref = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    $ver = ""
+    try {
+        $output = (& $cmd --version 2>&1)
+        # Store-Stub gibt deutschen Hinweistext zurueck, kein "Python 3.x"
+        if ($output -match "^Python 3\.(1[0-9]|[89])") {
+            $ver = $output.ToString().Trim()
+        }
+    } catch { }
+    $ErrorActionPreference = $oldPref
+    return $ver
+}
+
 # ---- Header ----
 Write-Host ""
 Write-Host "================================================================" -ForegroundColor Cyan
@@ -93,37 +124,74 @@ if ($ollamaCmd) {
 }
 
 # ---- Python pruefen / installieren ----
+# Hinweis: Windows 10/11 hat einen Store-Stub python.exe in WindowsApps
+# der keinen echten Interpreter startet sondern nur den Store oeffnet.
+# Test-RealPython filtert diesen Stub heraus.
 Write-Step "Python pruefen"
 $py = ""
-$pyCandidates = @("python", "python3", "py")
-foreach ($cmd in $pyCandidates) {
-    $found = Get-Command $cmd -ErrorAction SilentlyContinue
-    if ($found) {
-        $ver = (& $cmd --version 2>&1)
-        if ($ver -match "3\.(1[0-9]|[89])") {
-            $py = $cmd
-            Write-Ok "$cmd => $ver"
-            break
-        }
+foreach ($cmd in @("python3", "python", "py")) {
+    $ver = Test-RealPython $cmd
+    if ($ver -ne "") {
+        $py = $cmd
+        Write-Ok "$cmd => $ver"
+        break
     }
 }
+
 if ($py -eq "") {
-    Write-Warn "Python 3.8+ nicht gefunden."
+    Write-Warn "Kein echter Python 3.8+ Interpreter gefunden (Store-Stub zaehlt nicht)."
+    Write-Host "   Installiere Python 3.11 via winget..."
     if ($wingetCmd) {
         try {
-            winget install -e --id Python.Python.3.11 --silent --accept-package-agreements --accept-source-agreements
+            # AddToPath=1 damit python.exe nach Install im PATH steht
+            winget install -e --id Python.Python.3.11 --silent `
+                --accept-package-agreements --accept-source-agreements `
+                --override "/quiet InstallAllUsers=0 PrependPath=1 Include_pip=1"
+            # PATH in dieser Session sofort aktualisieren
             $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" +
                         [System.Environment]::GetEnvironmentVariable("PATH", "User")
-            $py = "python"
-            Write-Ok "Python 3.11 installiert."
+            # Kurz warten bis Installer fertig geschrieben hat
+            Start-Sleep -Seconds 3
+            # Nochmal pruefen
+            $ver = Test-RealPython "python"
+            if ($ver -ne "") {
+                $py = "python"
+                Write-Ok "Python installiert: $ver"
+            } else {
+                # PATH-Reload hat nicht gereicht - Fallback auf py.exe launcher
+                $ver = Test-RealPython "py"
+                if ($ver -ne "") {
+                    $py = "py"
+                    Write-Ok "Python installiert (via py launcher): $ver"
+                } else {
+                    Write-Warn "Python installiert aber noch nicht im PATH."
+                    Write-Warn "Bitte PowerShell-Fenster schliessen, neu oeffnen und Skript erneut ausfuehren."
+                    Write-Host "   (winget hat Python nach C:\Users\<name>\AppData\Local\Programs\Python\Python311 installiert)"
+                    exit 0
+                }
+            }
         } catch {
-            Write-Fail "Python-Install fehlgeschlagen. Manuell: https://python.org"
+            Write-Fail "Python-Install fehlgeschlagen: $_"
+            Write-Host "   Manuell: https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
+            Write-Host "   Wichtig: Haken bei 'Add Python to PATH' setzen!"
             exit 1
         }
     } else {
-        Write-Fail "Bitte Python manuell installieren: https://python.org"
+        Write-Fail "winget nicht verfuegbar. Bitte Python manuell installieren:"
+        Write-Host "   https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
+        Write-Host "   Wichtig: Haken bei 'Add Python to PATH' setzen!"
         exit 1
     }
+}
+
+# ---- pip + Basis-Pakete ----
+Write-Step "pip und Basis-Pakete installieren"
+try {
+    & $py -m pip install --upgrade pip --quiet
+    & $py -m pip install requests httpx --quiet
+    Write-Ok "pip, requests, httpx aktuell."
+} catch {
+    Write-Warn "pip-Update fehlgeschlagen (nicht kritisch): $_"
 }
 
 # ---- Repo-Pfad ----
@@ -132,16 +200,13 @@ Write-Ok "Repo-Root: $repoRoot"
 
 # ---- Ollama-Server starten (falls noetig) ----
 Write-Step "Ollama-Server starten"
-$ollamaRunning = $false
 try {
     $null = Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -TimeoutSec 3
-    $ollamaRunning = $true
     Write-Ok "Ollama-Server laeuft bereits."
 } catch {
     Write-Host "   Starte Ollama im Hintergrund..."
     Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Hidden
     Start-Sleep -Seconds 4
-    $ollamaRunning = $true
     Write-Ok "Ollama gestartet."
 }
 
@@ -182,9 +247,9 @@ Write-Host "================================================================"
 Write-Host ""
 Write-Host "  Naechste Schritte:"
 Write-Host ""
-Write-Host "  1. Neues PowerShell-Fenster oeffnen (LMS_HOST wirkt dann)"
+Write-Host "  1. Neues PowerShell-Fenster oeffnen (PATH + LMS_HOST wirken dann)"
 Write-Host ""
-Write-Host "  2. Chat starten:" 
+Write-Host "  2. Chat starten:"
 Write-Host "       .\windows\chat.ps1" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  3. Oder direkt:"
