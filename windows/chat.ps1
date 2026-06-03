@@ -7,6 +7,7 @@
 #   .\windows\chat.ps1
 #   .\windows\chat.ps1 -Model qwen2.5:1.5b
 #   .\windows\chat.ps1 -Model phi4-mini -DebugMode
+#   .\windows\chat.ps1 -NoColor
 #
 # Voraussetzung: windows/install.ps1 wurde ausgefuehrt
 # License: AGPL-3.0-or-later OR MIT  Copyright 2026 GrEEV.com KG
@@ -18,12 +19,32 @@ param(
     [string]$Model     = '',
     [string]$System    = '',
     [switch]$DebugMode,
-    [switch]$List
+    [switch]$List,
+    [switch]$NoColor
 )
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# ----------------------------------------------------------------
+# ANSI-Faehigkeit des aktuellen Terminals pruefen
+# powershell.exe 5.1 unterstuetzt kein ANSI -> --no-color setzen
+# pwsh 7+ und Windows Terminal unterstuetzen ANSI
+# ----------------------------------------------------------------
+function Test-AnsiSupport {
+    # Explizit deaktiviert
+    if ($NoColor) { return $false }
+    if ($env:NO_COLOR) { return $false }
+    # pwsh 7+ hat immer ANSI-Support
+    if ($PSVersionTable.PSVersion.Major -ge 7) { return $true }
+    # PS 5.1: ANSI nur wenn Windows Terminal (WT_SESSION env gesetzt)
+    if ($env:WT_SESSION) { return $true }
+    # Alles andere (powershell.exe ohne Windows Terminal) -> kein ANSI
+    return $false
+}
+
+$ansiSupport = Test-AnsiSupport
 
 # ----------------------------------------------------------------
 # Prueft ob ein python-Kommando ein echter Interpreter ist
@@ -91,6 +112,7 @@ if ($Model)     { $pyArgs += '--model';  $pyArgs += $Model }
 if ($System)    { $pyArgs += '--system'; $pyArgs += $System }
 if ($DebugMode) { $pyArgs += '--debug' }
 if ($List)      { $pyArgs += '--list' }
+if (-not $ansiSupport) { $pyArgs += '--no-color' }
 
 Write-Host "Host   : $env:LMS_HOST" -ForegroundColor DarkGray
 Write-Host "Python : $py" -ForegroundColor DarkGray
@@ -100,6 +122,8 @@ if ($env:PERPLEXITY_API_KEY) {
 } else {
     Write-Host "Search : DuckDuckGo (PERPLEXITY_API_KEY nicht gesetzt)" -ForegroundColor DarkGray
 }
+$colorHint = if ($ansiSupport) { "Farbe" } else { "Plain (PS5.1 - fuer Farben: pwsh 7 oder Windows Terminal)" }
+Write-Host "Output : $colorHint" -ForegroundColor DarkGray
 Write-Host ""
 
 & $py @pyArgs
