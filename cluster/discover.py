@@ -4,11 +4,12 @@ Probes all configured nodes and builds a live capability map.
 License: AGPL-3.0-or-later — Copyright 2026 GrEEV.com KG
 
 Zero external dependencies: reads network-map.json (stdlib json).
-YAML support is opportunistic — used only if pyyaml is already
-installed in the active environment. Never installs packages itself.
+YAML support is opportunistic — used only if pyyaml is installed.
 
-Runs as a background daemon on the coordinator (PRIMARY) node.
-CLI: python3 cluster/discover.py --once
+CLI:
+  python3 cluster/discover.py --once     # single probe, print JSON
+  python3 cluster/discover.py            # daemon loop (30s interval)
+  DISCOVER_INTERVAL=10 python3 cluster/discover.py
 """
 
 import argparse
@@ -27,15 +28,15 @@ _DIR            = Path(__file__).parent
 PROBE_INTERVAL  = int(os.environ.get("DISCOVER_INTERVAL", "30"))
 LIVE_NODES_OUT  = _DIR / "live-nodes.json"
 
-# Config search order: JSON first (zero deps), then YAML if pyyaml is present
 _MAP_CANDIDATES = [
     _DIR / "network-map.json",
     _DIR / "network-map.yaml",
-    _DIR / "network-map.json.example",  # last resort so --once always works
+    _DIR / "network-map.json.example",
 ]
 
 
 def load_network_map() -> dict:
+    """Load network map from disk. Called every probe cycle so edits take effect immediately."""
     for path in _MAP_CANDIDATES:
         if not path.exists():
             continue
@@ -45,25 +46,25 @@ def load_network_map() -> dict:
             if path.name.endswith(".example"):
                 log.warning("Using example network map — copy to network-map.json and set real IPs")
             else:
-                log.info("Network map: %s", path.name)
+                log.debug("Network map: %s", path.name)
             return data
         if path.suffix == ".yaml":
             try:
-                import yaml  # optional — never auto-installed
+                import yaml
                 with open(path) as f:
                     data = yaml.safe_load(f)
-                log.info("Network map: %s (pyyaml)", path.name)
+                log.debug("Network map: %s (pyyaml)", path.name)
                 return data
             except ImportError:
                 log.warning(
                     "%s found but pyyaml not installed. "
-                    "Create cluster/network-map.json or: pip install pyyaml",
+                    "Run: pip install pyyaml  or create cluster/network-map.json",
                     path.name
                 )
                 continue
     log.error(
         "No network map found. "
-        "Copy cluster/network-map.json.example → cluster/network-map.json "
+        "Copy cluster/network-map.json.example \u2192 cluster/network-map.json "
         "and fill in your IPs."
     )
     raise SystemExit(1)
@@ -84,11 +85,11 @@ def probe_node(node: dict, timeout: int = 4) -> dict:
         models  = [m["name"] for m in data.get("models", [])]
         result.update({"status": "online", "models": models,
                        "latency_ms": latency, "base_url": base_url})
-        log.info("  ✓ %s (%s) — %d models, %dms", node["name"], ip, len(models), latency)
+        log.info("  \u2713 %s (%s) \u2014 %d models, %dms", node["name"], ip, len(models), latency)
     except urllib.error.URLError:
-        log.info("  ✗ %s (%s) — offline", node["name"], ip)
+        log.info("  \u2717 %s (%s) \u2014 offline", node["name"], ip)
     except Exception as e:
-        log.warning("  ? %s (%s) — %s", node["name"], ip, e)
+        log.warning("  ? %s (%s) \u2014 %s", node["name"], ip, e)
     return result
 
 
@@ -116,11 +117,14 @@ def discover_once(network_map: dict) -> dict:
 
 
 def daemon_loop():
-    network_map = load_network_map()
-    log.info("Discovery daemon — interval %ds", PROBE_INTERVAL)
+    log.info("Discovery daemon — interval %ds (reloads map each cycle)", PROBE_INTERVAL)
     while True:
         try:
+            # Reload map from disk every cycle — edits take effect without restart
+            network_map = load_network_map()
             discover_once(network_map)
+        except SystemExit:
+            raise
         except Exception as e:
             log.error("Probe cycle: %s", e)
         time.sleep(PROBE_INTERVAL)
@@ -128,8 +132,10 @@ def daemon_loop():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true")
-    parser.add_argument("--interval", type=int, default=PROBE_INTERVAL)
+    parser.add_argument("--once",     action="store_true",
+                        help="Single probe cycle, print JSON, then exit")
+    parser.add_argument("--interval", type=int, default=PROBE_INTERVAL,
+                        help=f"Probe interval in seconds (default {PROBE_INTERVAL})")
     args = parser.parse_args()
     PROBE_INTERVAL = args.interval
     if args.once:
