@@ -13,6 +13,7 @@
 # LM Studio local server must be running for --test:
 #   Default: http://localhost:1234
 #   Set LMS_HOST=http://192.168.1.62:1234 to point at another machine.
+#   NOTE: remote IP only works if LM Studio binds to 0.0.0.0 (see README).
 #
 # License: AGPL-3.0-or-later OR MIT — Copyright 2026 GrEEV.com KG
 # =============================================================================
@@ -58,7 +59,6 @@ scan_models() {
   local found=()
   while IFS= read -r dir; do
     [ -d "$dir" ] || continue
-    # GGUF, safetensors, bin files are model files
     while IFS= read -r -d '' f; do
       found+=("$f")
     done < <(find "$dir" -maxdepth 4 -type f \( \
@@ -68,7 +68,6 @@ scan_models() {
       -print0 2>/dev/null)
   done < <(candidate_dirs)
 
-  # De-dup
   local seen=()
   for f in "${found[@]:-}"; do
     [[ " ${seen[*]:-} " == *" $f "* ]] && continue
@@ -105,9 +104,6 @@ cmd_list() {
     local filename; filename=$(basename "$filepath")
     local size; size=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null || echo 0)
     local size_fmt; size_fmt=$(fmt_size "$size")
-    local dir;  dir=$(dirname "$filepath")
-    # Derive a short model name from directory structure
-    # ~/.lmstudio/models/publisher/repo/file.gguf → publisher/repo
     local model_name; model_name=$(echo "$filepath" | sed -E \
       's|.*/models/([^/]+/[^/]+)/.*|\1|;s|.*/models/([^/]+)/[^/]+$|\1|')
 
@@ -117,7 +113,6 @@ cmd_list() {
     count=$((count + 1))
     total_bytes=$((total_bytes + size))
 
-    # Accumulate JSON
     json_entries=$(python3 -c "
 import json, sys
 entries = json.loads(sys.argv[1])
@@ -136,26 +131,28 @@ print(json.dumps(entries))
   fi
   echo
 
-  # Return JSON for --json flag
-  echo "$json_entries"
+  # Write JSON to a temp file so cmd_list output is clean (avoids macOS head -n -1 issue)
+  echo "$json_entries" > "${TMPDIR:-/tmp}/lms-models-$$.json"
 }
 
 # ---------------------------------------------------------------------------
 # Write models.json
 # ---------------------------------------------------------------------------
 cmd_json() {
-  local json_entries
-  json_entries=$(cmd_list | tail -1)  # last line is JSON
+  cmd_list
+  local tmp="${TMPDIR:-/tmp}/lms-models-$$.json"
+  [ -f "$tmp" ] || { echo "No scan data"; exit 1; }
   python3 -c "
 import json, sys, datetime
-entries = json.loads(sys.argv[1])
+entries = json.load(open(sys.argv[1]))
 out = {
     'generated_at': datetime.datetime.utcnow().isoformat() + 'Z',
     'lms_host': '$LMS_HOST',
     'models': entries
 }
 print(json.dumps(out, indent=2))
-" "$json_entries" > "$OUT_JSON"
+" "$tmp" > "$OUT_JSON"
+  rm -f "$tmp"
   echo -e "  ${GREEN}Written: $OUT_JSON${RESET}"
 }
 
@@ -167,34 +164,42 @@ cmd_test() {
   echo -e "${BOLD}LM Studio API Test${RESET}  ${DIM}$LMS_HOST${RESET}"
   echo
 
-  # 1. List models via /v1/models
   echo -e "  ${CYAN}GET $LMS_HOST/v1/models${RESET}"
   local models_json
-  models_json=$(curl -sf "$LMS_HOST/v1/models" \
+  models_json=$(curl -sf --max-time 5 "$LMS_HOST/v1/models" \
     -H "Content-Type: application/json" 2>/dev/null || echo "{}")
-  if echo "$models_json" | python3 -c "import json,sys; d=json.load(sys.stdin); [print(f\"    {m['id']}\") for m in d.get('data',[])]" 2>/dev/null; then
+
+  local model_count
+  model_count=$(echo "$models_json" | python3 -c \
+    "import json,sys; d=json.load(sys.stdin); m=d.get('data',[]); [print(f\"    {x['id']}\") for x in m]; print(len(m))" \
+    2>/dev/null | tail -1 || echo "0")
+
+  if [ "$model_count" = "0" ] || [ -z "$model_count" ]; then
+    echo -e "  ${YELLOW}Could not reach $LMS_HOST or no models listed.${RESET}"
     echo
-  else
-    echo -e "  ${YELLOW}  Could not reach $LMS_HOST — is LM Studio running with the local server enabled?${RESET}"
-    echo -e "  ${DIM}  In LM Studio: Developer tab → Start Server${RESET}"
+    # Detect if this is a LAN IP that likely needs binding change
+    if [[ "$LMS_HOST" =~ 192\.168\.|10\.|172\. ]]; then
+      echo -e "  ${YELLOW}Remote IP detected. LM Studio binds to localhost by default.${RESET}"
+      echo -e "  ${DIM}  Fix: LM Studio → Developer → Server → Network: change to 0.0.0.0${RESET}"
+      echo -e "  ${DIM}  Or use LM Link for encrypted remote access (no binding change needed).${RESET}"
+    else
+      echo -e "  ${DIM}  In LM Studio: Developer tab → Start Server${RESET}"
+    fi
     echo
     return
   fi
 
-  # 2. Pick first available model
+  echo
   local model_id
   model_id=$(echo "$models_json" | python3 -c \
     "import json,sys; d=json.load(sys.stdin); m=d.get('data',[]); print(m[0]['id'] if m else '')" \
     2>/dev/null || echo "")
 
-  if [ -z "$model_id" ]; then
-    echo -e "  ${YELLOW}No models loaded in LM Studio. Load a model first.${RESET}"
-    return
-  fi
+  [ -z "$model_id" ] && { echo -e "  ${YELLOW}No models loaded.${RESET}"; return; }
 
   echo -e "  ${CYAN}POST /v1/chat/completions${RESET}  model=$model_id"
   local response
-  response=$(curl -sf "$LMS_HOST/v1/chat/completions" \
+  response=$(curl -sf --max-time 30 "$LMS_HOST/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d "$(python3 -c "
 import json
@@ -224,7 +229,7 @@ print(json.dumps({
 # Dispatch
 # ---------------------------------------------------------------------------
 case "${1:-list}" in
-  list|'')  cmd_list | head -n -1 ;;  # strip trailing JSON line
+  list|'')  cmd_list ;;
   --json)   cmd_json ;;
   --test)   cmd_test ;;
   --host)   LMS_HOST="$2"; shift 2; cmd_test ;;
