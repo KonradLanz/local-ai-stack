@@ -1,73 +1,57 @@
 # =============================================================================
 # cluster/network-map.yaml
-# Static network map of all cluster nodes.
-# Fill in your actual pfsense DHCP-reserved IPs.
-# This file is read by the discovery daemon and install scripts.
+# REAL network map — greev-home-lab
+# Updated: 2026-06-03 from arp -a
 # License: AGPL-3.0-or-later OR MIT — Copyright 2026 GrEEV.com KG
 # =============================================================================
 #
-# SETUP INSTRUCTIONS (pfsense):
-#   1. Services → DHCP Server → select your LAN interface
-#   2. DHCP Static Mappings → Add
-#   3. Enter MAC address of each node, assign chosen IP
-#   4. Copy the IPs into this file
-#   5. Reboot nodes or release/renew DHCP leases
-#
-# TIP: Set a short hostname on each node matching the 'hostname' field below.
-# macOS: System Settings → General → About → Name
-# QNAP: Control Panel → System → General Settings → Server Name
-# Windows: Settings → System → About → Rename this PC
+# pfsense DHCP reservations recommended:
+#   Reserve each MAC → IP so these IPs never change.
+#   Services → DHCP Server → DHCP Static Mappings → Add
 
 cluster_name: "greev-home-lab"
-subnet: "192.168.1.0/24"         # adjust to your pfsense LAN subnet
-gateway: "192.168.1.1"           # pfsense LAN interface IP
+subnet: "192.168.1.0/24"
+gateway: "192.168.1.2"           # pfsense: 192.168.1.2
 
 nodes:
   - name: macbook-primary
     profile: primary
-    hostname: macbook-primary        # set this as macOS computer name
-    ip: "192.168.1.10"               # reserve in pfsense DHCP
-    mac: ""                          # fill in: System Report → Network → MAC
+    hostname: mbp-von-konrad
+    ip: "192.168.1.62"               # en0 — a4:4c:c8:5d:4c:8a
+    mac: "a4:4c:c8:5d:4c:8a"
     ollama_port: 11434
+    mesh_port: 11430
     openwebui_port: 3000
     enabled: true
 
-  - name: mac-mini-secondary
-    profile: secondary
-    hostname: mac-mini-secondary
-    ip: "192.168.1.11"               # reserve in pfsense DHCP
-    mac: ""
-    ollama_port: 11434
-    openwebui_port: 3001
-    enabled: false                   # set true when you add this node
-
   - name: qnap-nas
     profile: qnap
-    hostname: qnap-nas
-    ip: "192.168.1.20"               # reserve in pfsense DHCP
-    mac: ""                          # QNAP: Control Panel → Network → Interfaces
+    hostname: nas
+    ip: "192.168.1.201"              # nas.ad.own.dedyn.io — 24:5e:be:4f:d0:cd
+    mac: "24:5e:be:4f:d0:cd"
     ollama_port: 11434
+    mesh_port: 11430
     openwebui_port: 3002
     enabled: true
+
+  - name: enobo
+    profile: secondary
+    hostname: enobo
+    ip: "192.168.1.119"              # enobo.ad.own.dedyn.io — 00:1c:25:80:0b:b7
+    mac: "00:1c:25:80:0b:b7"
+    ollama_port: 11434
+    mesh_port: 11430
+    openwebui_port: 3001
+    enabled: false                   # set true once Ollama is installed on enobo
 
   - name: windows-pc-1
     profile: windows-thin
     hostname: windows-pc-1
-    ip: "192.168.1.30"               # reserve in pfsense DHCP
-    mac: ""                          # Windows: ipconfig /all
-    ollama_port: 11434
-    openwebui_port: 3003
-    enabled: false                   # set true when configured
-
-  - name: windows-pc-2
-    profile: windows-thin
-    hostname: windows-pc-2
-    ip: "192.168.1.31"
+    ip: "192.168.1.30"
     mac: ""
     ollama_port: 11434
     openwebui_port: 3003
     enabled: false
 
-# The discovery daemon (cluster/discover.py) reads this file and probes
-# each enabled node's Ollama health endpoint to build a live capability map.
-# It writes the result to cluster/live-nodes.json (gitignored).
+# Discovery daemon writes live state to cluster/live-nodes.json (gitignored).
+# Run: .venv/bin/python cluster/discover.py --once
