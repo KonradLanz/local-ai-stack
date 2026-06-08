@@ -9,6 +9,9 @@
 # SHA256 is cached in a sidecar file (<model>.gguf.sha256) next to each GGUF
 # so subsequent runs are instant. LM Studio ignores .sha256 files.
 #
+# GGUFs are made world-readable (chmod a+r) so the ollama daemon (which may
+# run as a different user) can access them via the shared inode.
+#
 # Multi-part GGUFs and mmproj files are skipped automatically.
 #
 # Usage:
@@ -39,6 +42,9 @@ Usage: $(basename "$0") [options]
 Register LM Studio GGUFs in Ollama via hard link (zero extra disk space).
 Direction: LM Studio -> Ollama
 
+GGUFs are made world-readable (chmod a+r) so the ollama daemon
+can access them even when running as a different user.
+
 Skipped automatically:
   - Multi-part GGUFs  (*-00001-of-*.gguf)
   - Multimodal projectors (mmproj-*.gguf)
@@ -61,6 +67,23 @@ log()  { printf '%s\n' "$*"; }
 vlog() { [ "$VERBOSE" -eq 1 ] && printf '%s\n' "$*" || true; }
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
+# Ensure a file is world-readable. Skipped in dry-run.
+ensure_readable() {
+  file="$1"
+  perms=$(stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file")
+  # Check if other-read bit (bit 2 of permissions octal) is set
+  if [ $(( 0${perms} & 4 )) -eq 0 ]; then
+    if [ "$DRY_RUN" -eq 0 ]; then
+      chmod a+r "$file"
+      vlog "  chmod a+r: $file"
+    else
+      log "  would chmod a+r: $file"
+    fi
+  else
+    vlog "  already world-readable: $file"
+  fi
+}
+
 # Return SHA256 hash for a file.
 # Uses sidecar cache (<file>.sha256) if available; computes and saves it otherwise.
 get_sha256() {
@@ -78,6 +101,7 @@ get_sha256() {
   hash=$(shasum -a 256 "$file" | awk '{print $1}')
   if [ "$DRY_RUN" -eq 0 ]; then
     printf '%s' "$hash" > "$sidecar"
+    chmod a+r "$sidecar"
     vlog "  sha256 cached -> $sidecar"
   fi
   printf '%s' "$hash"
@@ -148,6 +172,9 @@ while IFS= read -r gguf; do
   esac
 
   count=$((count + 1))
+
+  # Ensure GGUF is world-readable (ollama daemon may run as different user)
+  ensure_readable "$gguf"
 
   # Derive Ollama model tag from directory structure
   rel=${gguf#"$LMSTUDIO_ROOT"/}
