@@ -71,7 +71,6 @@ fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 ensure_readable() {
   file="$1"
   perms=$(stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file")
-  # Check if other-read bit (bit 2 of permissions octal) is set
   if [ $(( 0${perms} & 4 )) -eq 0 ]; then
     if [ "$DRY_RUN" -eq 0 ]; then
       chmod a+r "$file"
@@ -118,6 +117,34 @@ write_manifest() {
 JSON
 }
 
+# Verify all GGUF blobs are hard-linked to their LM Studio source.
+verify_hardlinks() {
+  log ""
+  log "=== Inode verification ==="
+  ok=0
+  broken=0
+
+  find "$LMSTUDIO_ROOT" -type f -name '*.gguf.sha256' \
+    -not -name '.DS_Store' -not -name '._*' | while IFS= read -r sidecar; do
+
+    gguf="${sidecar%.sha256}"
+    [ -f "$gguf" ] || continue
+    hash=$(cat "$sidecar" | tr -d '[:space:]')
+    blob="$BLOB_ROOT/sha256-${hash}"
+
+    [ -f "$blob" ] || { log "  MISSING blob: $(basename "$gguf")"; continue; }
+
+    src_inode=$(ls -i "$gguf" | awk '{print $1}')
+    dst_inode=$(ls -i "$blob" | awk '{print $1}')
+
+    if [ "$src_inode" = "$dst_inode" ]; then
+      log "  ✓ hardlinked  inode=$src_inode  $(basename "$gguf")"
+    else
+      log "  ✗ COPY        src=$src_inode  blob=$dst_inode  $(basename "$gguf")"
+    fi
+  done
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -n|--dry-run) DRY_RUN=1 ;;
@@ -153,7 +180,6 @@ while IFS= read -r gguf; do
 
   filename=$(basename "$gguf")
 
-  # Skip multimodal projectors
   case "$filename" in
     mmproj-*)
       vlog "skip mmproj: $filename"
@@ -162,7 +188,6 @@ while IFS= read -r gguf; do
       ;;
   esac
 
-  # Skip multi-part GGUFs (e.g. model-00001-of-00003.gguf)
   case "$filename" in
     *-[0-9][0-9][0-9][0-9][0-9]-of-[0-9][0-9][0-9][0-9][0-9]*)
       vlog "skip multi-part: $filename"
@@ -173,16 +198,13 @@ while IFS= read -r gguf; do
 
   count=$((count + 1))
 
-  # Ensure GGUF is world-readable (ollama daemon may run as different user)
   ensure_readable "$gguf"
 
-  # Derive Ollama model tag from directory structure
   rel=${gguf#"$LMSTUDIO_ROOT"/}
   namespace=$(printf '%s' "$rel" | cut -d'/' -f1)
   stem=$(basename "$filename" .gguf)
   model_name=$(printf '%s' "$stem" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
 
-  # Check if manifest already exists
   manifest_path="$MANIFEST_ROOT/$model_name/latest"
   if [ -f "$manifest_path" ]; then
     vlog "skip already registered: $model_name"
@@ -206,11 +228,9 @@ while IFS= read -r gguf; do
     continue
   fi
 
-  # Get SHA256 (sidecar cache or fresh compute)
   hash=$(get_sha256 "$gguf")
   blob_dest="$BLOB_ROOT/sha256-${hash}"
 
-  # Hard link blob (replace copy with hardlink if inode differs)
   if [ -f "$blob_dest" ]; then
     src_inode=$(ls -i "$gguf" | awk '{print $1}')
     dst_inode=$(ls -i "$blob_dest" | awk '{print $1}')
@@ -227,7 +247,6 @@ while IFS= read -r gguf; do
     log "  hardlinked: $blob_dest"
   fi
 
-  # Write manifest
   blob_size=$(stat -f%z "$gguf" 2>/dev/null || stat -c%s "$gguf")
   write_manifest "$manifest_path" "$hash" "$blob_size"
   log "  manifest: $manifest_path"
@@ -241,3 +260,10 @@ log ""
 log "GGUFs found          : $count"
 log "Imported/would import: $imported"
 log "Skipped              : $skipped"
+
+if [ "$DRY_RUN" -eq 0 ]; then
+  verify_hardlinks
+  log ""
+  log "=== Ollama model list ==="
+  ollama list 2>/dev/null || log "(ollama not in PATH or not running)"
+fi
