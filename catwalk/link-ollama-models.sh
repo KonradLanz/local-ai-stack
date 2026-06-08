@@ -69,7 +69,11 @@ BLOB_ROOT="$OLLAMA_ROOT/blobs"
 TMP_LIST="$(mktemp)"
 trap 'rm -f "$TMP_LIST"' EXIT HUP INT TERM
 
-find "$MANIFEST_ROOT" -type f > "$TMP_LIST"
+# Exclude macOS metadata files (.DS_Store, ._*) and only keep regular text files
+find "$MANIFEST_ROOT" -type f \
+  -not -name '.DS_Store' \
+  -not -name '._*' \
+  > "$TMP_LIST"
 
 count=0
 created=0
@@ -79,13 +83,35 @@ while IFS= read -r manifest; do
   [ -n "$manifest" ] || continue
   rel=${manifest#"$MANIFEST_ROOT"/}
 
+  # Skip if not valid JSON (first char must be '{')
+  first_char=$(head -c 1 "$manifest" 2>/dev/null || true)
+  if [ "$first_char" != "{" ]; then
+    vlog "skip non-JSON file: $rel"
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  # Try the standard mediaType first
   blob_digest=$(awk -F '"' '
     /"mediaType"[[:space:]]*:[[:space:]]*"application\/vnd\.ollama\.image\.model"/ {want=1}
     want && /"digest"[[:space:]]*:/ {print $4; exit}
   ' "$manifest")
 
+  # Fallback: grab the digest of the largest layer (model blob heuristic)
   if [ -z "$blob_digest" ]; then
-    vlog "skip manifest without model digest: $rel"
+    vlog "standard mediaType not found, trying largest-layer heuristic: $rel"
+    blob_digest=$(awk -F '"' '
+      /"digest"[[:space:]]*:/ {d=$4}
+      /"size"[[:space:]]*:/ {
+        gsub(/[^0-9]/,"",$0); s=$0+0
+        if (s > maxs) { maxs=s; best=d }
+      }
+      END { print best }
+    ' "$manifest")
+  fi
+
+  if [ -z "$blob_digest" ]; then
+    vlog "skip manifest without any digest: $rel"
     skipped=$((skipped + 1))
     continue
   fi
@@ -94,7 +120,7 @@ while IFS= read -r manifest; do
   src="$BLOB_ROOT/$blob_name"
 
   if [ ! -f "$src" ]; then
-    vlog "skip missing blob: $src"
+    vlog "skip missing blob ($blob_name): $rel"
     skipped=$((skipped + 1))
     continue
   fi
