@@ -2,7 +2,7 @@
 # link-ollama-models.sh — part of the Catwalk suite
 #
 # Create symlinks for Ollama GGUF model blobs inside LM Studio's model folder.
-# Works on macOS and Linux (POSIX sh, no external dependencies beyond awk/sed/find).
+# Works on macOS and Linux (POSIX sh, no external dependencies beyond awk/sed/find/grep).
 #
 # Usage:
 #   ./catwalk/link-ollama-models.sh [options]
@@ -47,6 +47,18 @@ log()  { printf '%s\n' "$*"; }
 vlog() { [ "$VERBOSE" -eq 1 ] && printf '%s\n' "$*" || true; }
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
+# Extract the digest for the model layer from a single-line or multi-line JSON manifest.
+# Strategy: find the segment containing the model mediaType and grab its digest.
+extract_model_digest() {
+  manifest="$1"
+  # Split on '},{'  to isolate each layer, then find the one with the model mediaType
+  # Works on both single-line and multi-line JSON
+  grep -o '"mediaType":"application/vnd\.ollama\.image\.model"[^}]*"digest":"[^"]*"' "$manifest" \
+    | grep -o '"digest":"[^"]*"' \
+    | head -1 \
+    | sed 's/"digest":"//;s/"//g'
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -n|--dry-run) DRY_RUN=1 ;;
@@ -69,7 +81,7 @@ BLOB_ROOT="$OLLAMA_ROOT/blobs"
 TMP_LIST="$(mktemp)"
 trap 'rm -f "$TMP_LIST"' EXIT HUP INT TERM
 
-# Exclude macOS metadata files (.DS_Store, ._*) and only keep regular text files
+# Exclude macOS metadata files
 find "$MANIFEST_ROOT" -type f \
   -not -name '.DS_Store' \
   -not -name '._*' \
@@ -83,35 +95,18 @@ while IFS= read -r manifest; do
   [ -n "$manifest" ] || continue
   rel=${manifest#"$MANIFEST_ROOT"/}
 
-  # Skip if not valid JSON (first char must be '{')
+  # Skip non-JSON
   first_char=$(head -c 1 "$manifest" 2>/dev/null || true)
   if [ "$first_char" != "{" ]; then
-    vlog "skip non-JSON file: $rel"
+    vlog "skip non-JSON: $rel"
     skipped=$((skipped + 1))
     continue
   fi
 
-  # Try the standard mediaType first
-  blob_digest=$(awk -F '"' '
-    /"mediaType"[[:space:]]*:[[:space:]]*"application\/vnd\.ollama\.image\.model"/ {want=1}
-    want && /"digest"[[:space:]]*:/ {print $4; exit}
-  ' "$manifest")
-
-  # Fallback: grab the digest of the largest layer (model blob heuristic)
-  if [ -z "$blob_digest" ]; then
-    vlog "standard mediaType not found, trying largest-layer heuristic: $rel"
-    blob_digest=$(awk -F '"' '
-      /"digest"[[:space:]]*:/ {d=$4}
-      /"size"[[:space:]]*:/ {
-        gsub(/[^0-9]/,"",$0); s=$0+0
-        if (s > maxs) { maxs=s; best=d }
-      }
-      END { print best }
-    ' "$manifest")
-  fi
+  blob_digest=$(extract_model_digest "$manifest")
 
   if [ -z "$blob_digest" ]; then
-    vlog "skip manifest without any digest: $rel"
+    vlog "skip manifest without model digest: $rel"
     skipped=$((skipped + 1))
     continue
   fi
