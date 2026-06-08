@@ -1,8 +1,9 @@
 #!/bin/sh
 # link-ollama-models.sh — part of the Catwalk suite
+# Direction: Ollama → LM Studio
 #
 # Create symlinks for Ollama GGUF model blobs inside LM Studio's model folder.
-# Works on macOS and Linux (POSIX sh, no external dependencies beyond awk/sed/find/grep).
+# Works on macOS and Linux (POSIX sh, no external dependencies beyond grep/sed/find).
 #
 # Usage:
 #   ./catwalk/link-ollama-models.sh [options]
@@ -15,12 +16,12 @@
 #
 # Environment:
 #   OLLAMA_ROOT     Ollama model store  (default: ~/.ollama/models)
-#   LMSTUDIO_ROOT   LM Studio target    (default: ~/.cache/lm-studio/models/ollama)
+#   LMSTUDIO_ROOT   LM Studio models    (default: ~/.lmstudio/models)
 
 set -eu
 
 OLLAMA_ROOT=${OLLAMA_ROOT:-"$HOME/.ollama/models"}
-LMSTUDIO_ROOT=${LMSTUDIO_ROOT:-"$HOME/.cache/lm-studio/models/ollama"}
+LMSTUDIO_ROOT=${LMSTUDIO_ROOT:-"$HOME/.lmstudio/models"}
 DRY_RUN=0
 FORCE=0
 VERBOSE=0
@@ -30,6 +31,7 @@ usage() {
 Usage: $(basename "$0") [options]
 
 Create symlinks for Ollama GGUF model blobs inside LM Studio's model folder.
+Direction: Ollama -> LM Studio
 
 Options:
   -n, --dry-run   Show what would be done without changing files
@@ -39,7 +41,7 @@ Options:
 
 Environment:
   OLLAMA_ROOT     Default: ~/.ollama/models
-  LMSTUDIO_ROOT   Default: ~/.cache/lm-studio/models/ollama
+  LMSTUDIO_ROOT   Default: ~/.lmstudio/models
 USAGE
 }
 
@@ -47,12 +49,8 @@ log()  { printf '%s\n' "$*"; }
 vlog() { [ "$VERBOSE" -eq 1 ] && printf '%s\n' "$*" || true; }
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
-# Extract the digest for the model layer from a single-line or multi-line JSON manifest.
-# Strategy: find the segment containing the model mediaType and grab its digest.
 extract_model_digest() {
   manifest="$1"
-  # Split on '},{'  to isolate each layer, then find the one with the model mediaType
-  # Works on both single-line and multi-line JSON
   grep -o '"mediaType":"application/vnd\.ollama\.image\.model"[^}]*"digest":"[^"]*"' "$manifest" \
     | grep -o '"digest":"[^"]*"' \
     | head -1 \
@@ -73,15 +71,14 @@ done
 [ -d "$OLLAMA_ROOT" ]  || fail "Ollama model root not found: $OLLAMA_ROOT"
 MANIFEST_ROOT="$OLLAMA_ROOT/manifests"
 BLOB_ROOT="$OLLAMA_ROOT/blobs"
-[ -d "$MANIFEST_ROOT" ] || fail "Ollama manifest directory not found: $MANIFEST_ROOT"
-[ -d "$BLOB_ROOT" ]     || fail "Ollama blob directory not found: $BLOB_ROOT"
+[ -d "$MANIFEST_ROOT" ] || fail "Manifest directory not found: $MANIFEST_ROOT"
+[ -d "$BLOB_ROOT" ]     || fail "Blob directory not found: $BLOB_ROOT"
 
 [ "$DRY_RUN" -eq 0 ] && mkdir -p "$LMSTUDIO_ROOT"
 
 TMP_LIST="$(mktemp)"
 trap 'rm -f "$TMP_LIST"' EXIT HUP INT TERM
 
-# Exclude macOS metadata files
 find "$MANIFEST_ROOT" -type f \
   -not -name '.DS_Store' \
   -not -name '._*' \
@@ -95,7 +92,6 @@ while IFS= read -r manifest; do
   [ -n "$manifest" ] || continue
   rel=${manifest#"$MANIFEST_ROOT"/}
 
-  # Skip non-JSON
   first_char=$(head -c 1 "$manifest" 2>/dev/null || true)
   if [ "$first_char" != "{" ]; then
     vlog "skip non-JSON: $rel"
@@ -106,7 +102,7 @@ while IFS= read -r manifest; do
   blob_digest=$(extract_model_digest "$manifest")
 
   if [ -z "$blob_digest" ]; then
-    vlog "skip manifest without model digest: $rel"
+    vlog "skip: no model digest found in $rel"
     skipped=$((skipped + 1))
     continue
   fi
@@ -115,7 +111,7 @@ while IFS= read -r manifest; do
   src="$BLOB_ROOT/$blob_name"
 
   if [ ! -f "$src" ]; then
-    vlog "skip missing blob ($blob_name): $rel"
+    vlog "skip: blob not found ($blob_name) for $rel"
     skipped=$((skipped + 1))
     continue
   fi
@@ -130,12 +126,12 @@ while IFS= read -r manifest; do
   if [ -e "$dest" ] || [ -L "$dest" ]; then
     if [ "$FORCE" -eq 1 ]; then
       if [ "$DRY_RUN" -eq 1 ]; then
-        log "would replace: $dest -> $src"
+        log "would replace: $dest"
       else
         mkdir -p "$dest_dir"
         rm -f "$dest"
         ln -s "$src" "$dest"
-        log "replaced: $dest -> $src"
+        log "replaced: $dest"
       fi
       created=$((created + 1))
     else
@@ -146,11 +142,11 @@ while IFS= read -r manifest; do
   fi
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    log "would link: $dest -> $src"
+    log "would link: $dest"
   else
     mkdir -p "$dest_dir"
     ln -s "$src" "$dest"
-    log "linked: $dest -> $src"
+    log "linked: $dest"
   fi
   created=$((created + 1))
 
