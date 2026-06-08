@@ -2,23 +2,33 @@
 # import-lmstudio-models.sh — part of the Catwalk suite
 # Direction: LM Studio → Ollama
 #
-# Imports single-file GGUF models from LM Studio into Ollama via 'ollama create'.
-# Multi-part GGUFs (00001-of-XXXXX) and mmproj files are skipped automatically.
+# Registers single-file GGUFs from LM Studio in Ollama by creating a hard link
+# directly into ~/.ollama/models/blobs/ and writing a minimal manifest.
+# No data is copied — both tools share the same inode.
+#
+# SHA256 is cached in a sidecar file (<model>.gguf.sha256) next to each GGUF
+# so subsequent runs are instant. LM Studio ignores .sha256 files.
+#
+# Multi-part GGUFs and mmproj files are skipped automatically.
 #
 # Usage:
 #   ./catwalk/import-lmstudio-models.sh [options]
 #
 # Options:
-#   -n, --dry-run   Show what would be done without importing
+#   -n, --dry-run   Show what would be done without changing files
 #   -v, --verbose   Print extra diagnostics
 #   -h, --help      Show this help
 #
 # Environment:
-#   LMSTUDIO_ROOT   LM Studio models    (default: ~/.lmstudio/models)
+#   LMSTUDIO_ROOT   LM Studio models  (default: ~/.lmstudio/models)
+#   OLLAMA_ROOT     Ollama store       (default: ~/.ollama/models)
 
 set -eu
 
 LMSTUDIO_ROOT=${LMSTUDIO_ROOT:-"$HOME/.lmstudio/models"}
+OLLAMA_ROOT=${OLLAMA_ROOT:-"$HOME/.ollama/models"}
+BLOB_ROOT="$OLLAMA_ROOT/blobs"
+MANIFEST_ROOT="$OLLAMA_ROOT/manifests/registry.ollama.ai/library"
 DRY_RUN=0
 VERBOSE=0
 
@@ -26,27 +36,63 @@ usage() {
   cat <<USAGE
 Usage: $(basename "$0") [options]
 
-Import single-file GGUF models from LM Studio into Ollama.
+Register LM Studio GGUFs in Ollama via hard link (zero extra disk space).
 Direction: LM Studio -> Ollama
 
 Skipped automatically:
   - Multi-part GGUFs  (*-00001-of-*.gguf)
   - Multimodal projectors (mmproj-*.gguf)
-  - Models already known to Ollama
+  - Models already registered in Ollama
+
+SHA256 is cached in <model>.gguf.sha256 next to each file.
 
 Options:
-  -n, --dry-run   Show what would be done without importing
+  -n, --dry-run   Show what would be done without changing files
   -v, --verbose   Print extra diagnostics
   -h, --help      Show this help
 
 Environment:
   LMSTUDIO_ROOT   Default: ~/.lmstudio/models
+  OLLAMA_ROOT     Default: ~/.ollama/models
 USAGE
 }
 
 log()  { printf '%s\n' "$*"; }
 vlog() { [ "$VERBOSE" -eq 1 ] && printf '%s\n' "$*" || true; }
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+# Return SHA256 hash for a file.
+# Uses sidecar cache (<file>.sha256) if available; computes and saves it otherwise.
+get_sha256() {
+  file="$1"
+  sidecar="${file}.sha256"
+
+  if [ -f "$sidecar" ]; then
+    hash=$(cat "$sidecar" | tr -d '[:space:]')
+    vlog "  sha256 (cached): $hash"
+    printf '%s' "$hash"
+    return
+  fi
+
+  log "  computing sha256 (first time, may take a minute for large files)..."
+  hash=$(shasum -a 256 "$file" | awk '{print $1}')
+  if [ "$DRY_RUN" -eq 0 ]; then
+    printf '%s' "$hash" > "$sidecar"
+    vlog "  sha256 cached -> $sidecar"
+  fi
+  printf '%s' "$hash"
+}
+
+# Write a minimal Ollama manifest for a model.
+write_manifest() {
+  manifest_path="$1"
+  blob_hash="$2"
+  blob_size="$3"
+  mkdir -p "$(dirname "$manifest_path")"
+  cat > "$manifest_path" <<JSON
+{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"mediaType":"application/vnd.docker.container.image.v1+json","digest":"sha256:${blob_hash}","size":256},"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:${blob_hash}","size":${blob_size}}]}
+JSON
+}
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -59,11 +105,15 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -d "$LMSTUDIO_ROOT" ] || fail "LM Studio model root not found: $LMSTUDIO_ROOT"
-command -v ollama >/dev/null 2>&1 || fail "ollama not found in PATH"
+[ -d "$OLLAMA_ROOT" ]   || fail "Ollama root not found: $OLLAMA_ROOT"
+
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$BLOB_ROOT"
+  mkdir -p "$MANIFEST_ROOT"
+fi
 
 TMP_LIST="$(mktemp)"
-TMP_MODELFILE="$(mktemp)"
-trap 'rm -f "$TMP_LIST" "$TMP_MODELFILE"' EXIT HUP INT TERM
+trap 'rm -f "$TMP_LIST"' EXIT HUP INT TERM
 
 find "$LMSTUDIO_ROOT" -type f -name '*.gguf' \
   -not -name '.DS_Store' \
@@ -97,39 +147,66 @@ while IFS= read -r gguf; do
       ;;
   esac
 
-  # Derive a clean Ollama model name from the directory structure
-  # e.g. ~/.lmstudio/models/lmstudio-community/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf
-  # -> lmstudio-community/gemma-4-31B-it-Q4_K_M
+  count=$((count + 1))
+
+  # Derive Ollama model tag from directory structure
   rel=${gguf#"$LMSTUDIO_ROOT"/}
   namespace=$(printf '%s' "$rel" | cut -d'/' -f1)
   stem=$(basename "$filename" .gguf)
-  # lowercase and replace spaces/underscores with hyphens for Ollama naming
-  model_tag=$(printf '%s/%s' "$namespace" "$stem" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+  model_name=$(printf '%s' "$stem" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
 
-  count=$((count + 1))
-
-  # Check if already imported
-  if ollama show "$model_tag" >/dev/null 2>&1; then
-    vlog "skip already in Ollama: $model_tag"
+  # Check if manifest already exists
+  manifest_path="$MANIFEST_ROOT/$model_name/latest"
+  if [ -f "$manifest_path" ]; then
+    vlog "skip already registered: $model_name"
     skipped=$((skipped + 1))
     continue
   fi
+
+  log "processing: $namespace/$model_name"
+  log "  source: $gguf"
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    log "would import: $model_tag  ($filename)"
+    sidecar="${gguf}.sha256"
+    if [ -f "$sidecar" ]; then
+      hash=$(cat "$sidecar" | tr -d '[:space:]')
+      log "  would hardlink blob: sha256-${hash}"
+    else
+      log "  would compute sha256 + hardlink blob (no sidecar yet)"
+    fi
+    log "  would write manifest: $manifest_path"
     imported=$((imported + 1))
     continue
   fi
 
-  log "importing: $model_tag  ($filename)"
-  printf 'FROM %s\n' "$gguf" > "$TMP_MODELFILE"
-  if ollama create "$model_tag" -f "$TMP_MODELFILE"; then
-    log "  done: $model_tag"
-    imported=$((imported + 1))
+  # Get SHA256 (sidecar cache or fresh compute)
+  hash=$(get_sha256 "$gguf")
+  blob_dest="$BLOB_ROOT/sha256-${hash}"
+
+  # Hard link blob (replace copy with hardlink if inode differs)
+  if [ -f "$blob_dest" ]; then
+    src_inode=$(ls -i "$gguf" | awk '{print $1}')
+    dst_inode=$(ls -i "$blob_dest" | awk '{print $1}')
+    if [ "$src_inode" = "$dst_inode" ]; then
+      vlog "  blob already hardlinked (same inode)"
+    else
+      log "  replacing copy with hardlink (recovering disk space)..."
+      rm -f "$blob_dest"
+      ln "$gguf" "$blob_dest"
+      log "  hardlinked: $blob_dest"
+    fi
   else
-    log "  FAILED: $model_tag" >&2
-    skipped=$((skipped + 1))
+    ln "$gguf" "$blob_dest"
+    log "  hardlinked: $blob_dest"
   fi
+
+  # Write manifest
+  blob_size=$(stat -f%z "$gguf" 2>/dev/null || stat -c%s "$gguf")
+  write_manifest "$manifest_path" "$hash" "$blob_size"
+  log "  manifest: $manifest_path"
+  log "  done: $namespace/$model_name"
+
+  imported=$((imported + 1))
 
 done < "$TMP_LIST"
 
